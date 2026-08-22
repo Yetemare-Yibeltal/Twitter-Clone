@@ -1,4 +1,4 @@
-// backend/internal/repository/interfaces/tweet_repo.go
+// backend/internal/repository/interfaces/retweet_repo.go
 package interfaces
 
 import (
@@ -6,176 +6,284 @@ import (
 	"database/sql"
 	"errors"
 	"time"
-
-	"twitter-clone/backend/internal/domain/entities"
-	"twitter-clone/backend/internal/dto"
 )
 
 // ======================================================================
-= Common Errors
+// Common Errors
 // ======================================================================
 
 var (
-	ErrTweetNotFound      = errors.New("tweet not found")
-	ErrTweetDeleted       = errors.New("tweet has been deleted")
-	ErrAlreadyLiked       = errors.New("already liked this tweet")
-	ErrAlreadyRetweeted   = errors.New("already retweeted this tweet")
-	ErrAlreadyBookmarked  = errors.New("already bookmarked this tweet")
-	ErrLikeNotFound       = errors.New("like not found")
-	ErrRetweetNotFound    = errors.New("retweet not found")
-	ErrBookmarkNotFound   = errors.New("bookmark not found")
-	ErrPollNotFound       = errors.New("poll not found")
-	ErrPollExpired        = errors.New("poll has expired")
-	ErrPollAlreadyVoted   = errors.New("already voted on this poll")
-	ErrInvalidPollOption  = errors.New("invalid poll option")
-	ErrInvalidContent     = errors.New("invalid tweet content")
-	ErrContentTooLong     = errors.New("tweet content exceeds maximum length")
-	ErrEmptyContent       = errors.New("tweet content cannot be empty")
+	ErrRetweetNotFound      = errors.New("retweet not found")
+	ErrAlreadyRetweeted     = errors.New("already retweeted this tweet")
+	ErrInvalidRetweetID     = errors.New("invalid retweet ID")
+	ErrInvalidTweetID       = errors.New("invalid tweet ID")
+	ErrInvalidUserID        = errors.New("invalid user ID")
+	ErrCannotRetweetOwn     = errors.New("cannot retweet your own tweet")
+	ErrRetweetDisabled      = errors.New("retweeting is disabled for this tweet")
+	ErrRetweetNotFoundByUser = errors.New("retweet not found for this user and tweet")
 )
 
 // ======================================================================
-= TweetRepository Interface
+// RetweetFilter
 // ======================================================================
 
-// TweetRepository defines the interface for tweet data persistence.
-type TweetRepository interface {
+// RetweetFilter defines filtering options for retweet queries.
+type RetweetFilter struct {
+	TweetID    *string
+	UserID     *string
+	CreatedFrom *time.Time
+	CreatedTo  *time.Time
+	MinRetweets *int64
+	MaxRetweets *int64
+}
+
+// HasCriteria checks if any filter criteria are set.
+func (f *RetweetFilter) HasCriteria() bool {
+	return f.TweetID != nil || f.UserID != nil ||
+		f.CreatedFrom != nil || f.CreatedTo != nil ||
+		f.MinRetweets != nil || f.MaxRetweets != nil
+}
+
+// ======================================================================
+// RetweetPagination
+// ======================================================================
+
+// RetweetSortField defines sortable fields for retweets.
+type RetweetSortField string
+
+const (
+	SortRetweetByCreatedAt RetweetSortField = "created_at"
+	SortRetweetByUpdatedAt RetweetSortField = "updated_at"
+)
+
+// RetweetSortOrder defines sort order.
+type RetweetSortOrder string
+
+const (
+	RetweetSortAsc  RetweetSortOrder = "ASC"
+	RetweetSortDesc RetweetSortOrder = "DESC"
+)
+
+// RetweetPagination holds pagination options for retweets.
+type RetweetPagination struct {
+	Cursor string             `json:"cursor"`
+	Limit  int                `json:"limit"`
+	SortBy RetweetSortField   `json:"sort_by"`
+	Order  RetweetSortOrder   `json:"order"`
+}
+
+// DefaultRetweetPagination returns default pagination options.
+func DefaultRetweetPagination() *RetweetPagination {
+	return &RetweetPagination{
+		Limit:  20,
+		SortBy: SortRetweetByCreatedAt,
+		Order:  RetweetSortDesc,
+	}
+}
+
+// Validate checks pagination parameters.
+func (p *RetweetPagination) Validate() error {
+	if p.Limit < 1 || p.Limit > 100 {
+		return errors.New("limit must be between 1 and 100")
+	}
+	return nil
+}
+
+// ======================================================================
+// RetweetStats
+// ======================================================================
+
+// RetweetStats represents aggregated retweet statistics.
+type RetweetStats struct {
+	TotalRetweets        int64     `json:"total_retweets"`
+	UniqueUsers          int64     `json:"unique_users"`
+	UniqueTweets         int64     `json:"unique_tweets"`
+	RetweetsPerUser      float64   `json:"retweets_per_user"`
+	RetweetsPerTweet     float64   `json:"retweets_per_tweet"`
+	LastRetweet          time.Time `json:"last_retweet"`
+	FirstRetweet         time.Time `json:"first_retweet"`
+	MostRetweetedTweetID string    `json:"most_retweeted_tweet_id"`
+	MostRetweetedTweetCount int64  `json:"most_retweeted_tweet_count"`
+	MostActiveRetweeterID string   `json:"most_active_retweeter_id"`
+	MostActiveRetweeterCount int64 `json:"most_active_retweeter_count"`
+}
+
+// ======================================================================
+= DailyRetweetCount
+// ======================================================================
+
+// DailyRetweetCount represents daily retweet counts.
+type DailyRetweetCount struct {
+	Date         time.Time `json:"date"`
+	Total        int64     `json:"total"`
+	UniqueUsers  int64     `json:"unique_users"`
+	UniqueTweets int64     `json:"unique_tweets"`
+}
+
+// ======================================================================
+= RetweetRepository Interface
+// ======================================================================
+
+// RetweetRepository defines the interface for retweet data persistence.
+type RetweetRepository interface {
 	// --------------------------------------------------------------------
 	// Basic CRUD
 	// --------------------------------------------------------------------
 
-	// Create inserts a new tweet.
-	Create(ctx context.Context, tweet *entities.Tweet) error
+	// Create creates a new retweet.
+	Create(ctx context.Context, retweet *entities.Retweet) error
 
-	// GetByID retrieves a tweet by its primary key, excluding soft-deleted.
-	GetByID(ctx context.Context, id string) (*entities.Tweet, error)
+	// GetByID retrieves a retweet by its ID.
+	GetByID(ctx context.Context, id string) (*entities.Retweet, error)
 
-	// Update updates a tweet's content and media (owner only).
-	Update(ctx context.Context, tweet *entities.Tweet) error
+	// GetByTweetAndUser retrieves a retweet by tweet ID and user ID.
+	GetByTweetAndUser(ctx context.Context, tweetID, userID string) (*entities.Retweet, error)
 
-	// SoftDelete marks a tweet as deleted (sets deleted_at).
-	SoftDelete(ctx context.Context, id string) error
+	// Delete removes a retweet.
+	Delete(ctx context.Context, id string) error
 
-	// HardDelete permanently removes a tweet.
-	HardDelete(ctx context.Context, id string) error
-
-	// --------------------------------------------------------------------
-	// Feed & List Queries
-	// --------------------------------------------------------------------
-
-	// GetFeed returns tweets from a list of user IDs, ordered by created_at DESC,
-	// with cursor-based pagination. Excludes deleted tweets.
-	GetFeed(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Tweet, string, error)
-
-	// GetByUserID returns tweets by a specific user, optionally including replies.
-	GetByUserID(ctx context.Context, userID, cursor string, limit int, includeReplies bool) ([]*entities.Tweet, string, error)
-
-	// GetReplies returns replies to a specific tweet, ordered by created_at ASC (oldest first).
-	GetReplies(ctx context.Context, tweetID, cursor string, limit int) ([]*entities.Tweet, string, error)
-
-	// CountReplies returns the total number of replies to a tweet.
-	CountReplies(ctx context.Context, tweetID string) (int64, error)
+	// DeleteByTweetAndUser removes a retweet by tweet and user.
+	DeleteByTweetAndUser(ctx context.Context, tweetID, userID string) error
 
 	// --------------------------------------------------------------------
-	// Search
+	// Existence Checks
 	// --------------------------------------------------------------------
 
-	// Search performs full-text search on tweet content and returns matching tweets.
-	Search(ctx context.Context, query string, cursor string, limit int) ([]*entities.Tweet, string, error)
+	// Exists checks if a user has retweeted a tweet.
+	Exists(ctx context.Context, tweetID, userID string) (bool, error)
 
 	// --------------------------------------------------------------------
-	// Trending
+	// Count Operations
 	// --------------------------------------------------------------------
 
-	// GetTrending returns trending topics (hashtags) based on tweet frequency over the last 24h.
-	GetTrending(ctx context.Context, limit int) ([]*dto.TrendingTopic, error)
+	// CountByTweetID returns the number of retweets for a tweet.
+	CountByTweetID(ctx context.Context, tweetID string) (int64, error)
+
+	// CountByUserID returns the total number of retweets made by a user.
+	CountByUserID(ctx context.Context, userID string) (int64, error)
+
+	// CountByTweetIDs returns retweet counts for multiple tweets (bulk).
+	CountByTweetIDs(ctx context.Context, tweetIDs []string) (map[string]int64, error)
+
+	// CountByUserIDs returns retweet counts for multiple users (bulk).
+	CountByUserIDs(ctx context.Context, userIDs []string) (map[string]int64, error)
+
+	// CountByDateRange returns retweet count within a date range.
+	CountByDateRange(ctx context.Context, start, end time.Time) (int64, error)
+
+	// CountByDateRangeForUser returns retweet count for a user within a date range.
+	CountByDateRangeForUser(ctx context.Context, userID string, start, end time.Time) (int64, error)
 
 	// --------------------------------------------------------------------
-	// Interaction Counts
+	// List Operations
 	// --------------------------------------------------------------------
 
-	// GetLikeCount returns the number of likes for a tweet.
-	GetLikeCount(ctx context.Context, tweetID string) (int64, error)
+	// GetByTweetID returns all retweets for a tweet with pagination.
+	GetByTweetID(ctx context.Context, tweetID string, cursor string, limit int) ([]*entities.Retweet, string, error)
 
-	// GetRetweetCount returns the number of retweets for a tweet.
-	GetRetweetCount(ctx context.Context, tweetID string) (int64, error)
+	// GetByUserID returns all retweets made by a user with pagination.
+	GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Retweet, string, error)
 
-	// --------------------------------------------------------------------
-	// Likes
-	// --------------------------------------------------------------------
+	// GetRetweetedTweetIDs returns all tweet IDs retweeted by a user.
+	GetRetweetedTweetIDs(ctx context.Context, userID string) ([]string, error)
 
-	// Like adds a like from a user to a tweet. Returns ErrAlreadyLiked if already liked.
-	Like(ctx context.Context, tweetID, userID string) error
+	// GetRetweetedTweets returns full tweet objects retweeted by a user.
+	GetRetweetedTweets(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Tweet, string, error)
 
-	// Unlike removes a like. Returns ErrLikeNotFound if like doesn't exist.
-	Unlike(ctx context.Context, tweetID, userID string) error
+	// GetRetweeters returns users who retweeted a specific tweet.
+	GetRetweeters(ctx context.Context, tweetID string, cursor string, limit int) ([]*entities.User, string, error)
 
-	// IsLiked checks if a user has liked a tweet.
-	IsLiked(ctx context.Context, tweetID, userID string) (bool, error)
-
-	// --------------------------------------------------------------------
-	// Retweets
-	// --------------------------------------------------------------------
-
-	// Retweet adds a retweet. Returns ErrAlreadyRetweeted if already retweeted.
-	Retweet(ctx context.Context, tweetID, userID string) error
-
-	// Unretweet removes a retweet. Returns ErrRetweetNotFound if retweet doesn't exist.
-	Unretweet(ctx context.Context, tweetID, userID string) error
-
-	// IsRetweeted checks if a user has retweeted a tweet.
-	IsRetweeted(ctx context.Context, tweetID, userID string) (bool, error)
+	// GetRetweetersWithTime returns users who retweeted a tweet with time of retweet.
+	GetRetweetersWithTime(ctx context.Context, tweetID string, cursor string, limit int) ([]*RetweetWithUser, string, error)
 
 	// --------------------------------------------------------------------
-	// Bookmarks
+	// Timeline and Feed
 	// --------------------------------------------------------------------
 
-	// Bookmark adds a bookmark. Returns ErrAlreadyBookmarked if already bookmarked.
-	Bookmark(ctx context.Context, tweetID, userID string) error
+	// GetRetweetsTimeline returns retweets in reverse chronological order for a user's feed.
+	GetRetweetsTimeline(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Retweet, string, error)
 
-	// Unbookmark removes a bookmark. Returns ErrBookmarkNotFound if bookmark doesn't exist.
-	Unbookmark(ctx context.Context, tweetID, userID string) error
+	// GetRecentRetweets returns the most recent retweets for a user.
+	GetRecentRetweets(ctx context.Context, userID string, limit int) ([]*entities.Retweet, error)
 
-	// IsBookmarked checks if a user has bookmarked a tweet.
-	IsBookmarked(ctx context.Context, tweetID, userID string) (bool, error)
-
-	// GetBookmarksByUser returns tweets bookmarked by a user, with pagination.
-	GetBookmarksByUser(ctx context.Context, userID, cursor string, limit int) ([]*entities.Tweet, string, error)
+	// GetRecentRetweetsForTweets returns recent retweets for a list of tweets.
+	GetRecentRetweetsForTweets(ctx context.Context, tweetIDs []string, limit int) (map[string][]*entities.Retweet, error)
 
 	// --------------------------------------------------------------------
-	// Polls
+	// Advanced Queries
 	// --------------------------------------------------------------------
 
-	// CreatePoll creates a new poll associated with a tweet.
-	CreatePoll(ctx context.Context, poll *entities.Poll) error
+	// GetMostRetweetedTweets returns the most retweeted tweets (trending).
+	GetMostRetweetedTweets(ctx context.Context, limit int, since time.Time) ([]*entities.Tweet, error)
 
-	// GetPollByTweetID retrieves a poll by its tweet ID.
-	GetPollByTweetID(ctx context.Context, tweetID string) (*entities.Poll, error)
+	// GetMostRetweetedTweetsByCategory returns most retweeted tweets by category.
+	GetMostRetweetedTweetsByCategory(ctx context.Context, category string, limit int, since time.Time) ([]*entities.Tweet, error)
 
-	// VotePoll adds a vote from a user to a poll option. Returns ErrPollExpired, ErrPollAlreadyVoted, or ErrInvalidPollOption.
-	VotePoll(ctx context.Context, pollID, userID, optionID string) error
+	// GetMostActiveRetweeters returns users with the most retweets.
+	GetMostActiveRetweeters(ctx context.Context, limit int, since time.Time) ([]*RetweeterStats, error)
 
-	// GetPollResults returns the poll with up‑to‑date vote counts.
-	GetPollResults(ctx context.Context, pollID string) (*entities.Poll, error)
+	// GetRetweetsByHour returns retweets grouped by hour of day.
+	GetRetweetsByHour(ctx context.Context, tweetID string) ([]*HourlyRetweetCount, error)
+
+	// GetRetweetsByDayOfWeek returns retweets grouped by day of week.
+	GetRetweetsByDayOfWeek(ctx context.Context, tweetID string) ([]*DayOfWeekRetweetCount, error)
+
+	// GetRetweetChains returns retweet chains for a tweet (who retweeted whom).
+	GetRetweetChains(ctx context.Context, tweetID string, maxDepth int) ([]*RetweetChain, error)
 
 	// --------------------------------------------------------------------
-	// Advanced / Bulk Operations
+	// Bulk Operations
 	// --------------------------------------------------------------------
 
-	// DeleteAllByUserID soft-deletes all tweets by a user (for account deletion).
-	DeleteAllByUserID(ctx context.Context, userID string) error
+	// BulkCreate inserts multiple retweets in a single transaction.
+	BulkCreate(ctx context.Context, retweets []*entities.Retweet) error
 
-	// GetTweetsByIDs retrieves multiple tweets by their IDs in bulk.
-	GetTweetsByIDs(ctx context.Context, ids []string) ([]*entities.Tweet, error)
+	// BulkDelete removes multiple retweets in a single transaction.
+	BulkDelete(ctx context.Context, ids []string) error
+
+	// BulkDeleteByTweetID removes all retweets for a tweet.
+	BulkDeleteByTweetID(ctx context.Context, tweetID string) error
+
+	// BulkDeleteByUserID removes all retweets made by a user.
+	BulkDeleteByUserID(ctx context.Context, userID string) error
+
+	// BulkDeleteByTweetAndUser removes retweets for multiple tweet-user pairs.
+	BulkDeleteByTweetAndUser(ctx context.Context, pairs []TweetUserPair) error
+
+	// --------------------------------------------------------------------
+	// Stats and Analytics
+	// --------------------------------------------------------------------
+
+	// GetRetweetStats returns aggregated retweet statistics.
+	GetRetweetStats(ctx context.Context) (*RetweetStats, error)
+
+	// GetUserRetweetStats returns retweet statistics for a specific user.
+	GetUserRetweetStats(ctx context.Context, userID string) (*RetweetStats, error)
+
+	// GetTweetRetweetStats returns retweet statistics for a specific tweet.
+	GetTweetRetweetStats(ctx context.Context, tweetID string) (*RetweetStats, error)
+
+	// GetDailyRetweetStats returns daily retweet counts for a date range.
+	GetDailyRetweetStats(ctx context.Context, start, end time.Time) ([]*DailyRetweetCount, error)
+
+	// GetDailyRetweetStatsForUser returns daily retweet counts for a user.
+	GetDailyRetweetStatsForUser(ctx context.Context, userID string, start, end time.Time) ([]*DailyRetweetCount, error)
+
+	// GetRetweetEngagementRate calculates retweet engagement rate for a tweet.
+	GetRetweetEngagementRate(ctx context.Context, tweetID string) (float64, error)
+
+	// GetRetweetConversionRate calculates conversion rate from view to retweet.
+	GetRetweetConversionRate(ctx context.Context, tweetID string) (float64, error)
 
 	// --------------------------------------------------------------------
 	// Transaction Support
 	// --------------------------------------------------------------------
 
-	// WithTransaction returns a new repository instance using the given transaction.
-	WithTransaction(ctx context.Context, tx *sql.Tx) TweetRepository
+	// WithTransaction returns a new repository using the given transaction.
+	WithTransaction(ctx context.Context, tx *sql.Tx) RetweetRepository
 
 	// Transaction executes a function within a database transaction.
-	Transaction(ctx context.Context, fn func(txRepo TweetRepository) error) error
+	Transaction(ctx context.Context, fn func(txRepo RetweetRepository) error) error
 
 	// --------------------------------------------------------------------
 	// Health and Cleanup
@@ -184,110 +292,71 @@ type TweetRepository interface {
 	// Ping checks database connectivity.
 	Ping(ctx context.Context) error
 
-	// Close releases any resources (pool connections).
+	// Close releases any resources.
 	Close() error
 
-	// GetRawDB returns the underlying *sql.DB or *sqlx.DB for advanced use (optional).
+	// GetRawDB returns the underlying database connection.
 	GetRawDB() interface{}
 }
 
 // ======================================================================
-= Additional Interfaces (optional extensions)
+= Supporting Types
 // ======================================================================
 
-// TweetRepositorySearch provides advanced search capabilities.
-type TweetRepositorySearch interface {
-	TweetRepository
-	// FullTextSearch performs full-text search with custom ranking.
-	FullTextSearch(ctx context.Context, query string, minRank float64, cursor string, limit int) ([]*entities.Tweet, string, error)
+// RetweetWithUser represents a retweet with associated user data.
+type RetweetWithUser struct {
+	Retweet *entities.Retweet `json:"retweet"`
+	User    *entities.User    `json:"user"`
 }
 
-// TweetRepositoryAnalytics provides analytics methods.
-type TweetRepositoryAnalytics interface {
-	TweetRepository
-	// GetTweetStats returns aggregated stats for a tweet.
-	GetTweetStats(ctx context.Context, tweetID string) (*TweetStats, error)
-	// GetDailyTweetCount returns tweet count for a user per day.
-	GetDailyTweetCount(ctx context.Context, userID string, days int) ([]*DailyCount, error)
+// RetweeterStats represents statistics for a user who retweets.
+type RetweeterStats struct {
+	UserID       string `json:"user_id"`
+	Username     string `json:"username"`
+	FullName     string `json:"full_name"`
+	AvatarURL    string `json:"avatar_url"`
+	RetweetCount int64  `json:"retweet_count"`
 }
 
-// TweetStats represents aggregated tweet stats.
-type TweetStats struct {
-	TweetID      string    `json:"tweet_id"`
-	LikeCount    int64     `json:"like_count"`
-	RetweetCount int64     `json:"retweet_count"`
-	ReplyCount   int64     `json:"reply_count"`
-	BookmarkCount int64    `json:"bookmark_count"`
-	ViewCount    int64     `json:"view_count"`
-	LastUpdated  time.Time `json:"last_updated"`
+// TweetUserPair represents a tweet-user pair for bulk delete.
+type TweetUserPair struct {
+	TweetID string `json:"tweet_id"`
+	UserID  string `json:"user_id"`
 }
 
-// DailyCount represents a daily count.
-type DailyCount struct {
-	Date  time.Time `json:"date"`
-	Count int64     `json:"count"`
+// HourlyRetweetCount represents retweet counts by hour.
+type HourlyRetweetCount struct {
+	Hour  int   `json:"hour"`
+	Count int64 `json:"count"`
 }
 
-// ======================================================================
-= Helper Types and Constants
-// ======================================================================
-
-// TweetSortField defines sortable fields for tweets.
-type TweetSortField string
-
-const (
-	SortByCreatedAt TweetSortField = "created_at"
-	SortByUpdatedAt TweetSortField = "updated_at"
-	SortByLikeCount TweetSortField = "like_count"
-	SortByRetweetCount TweetSortField = "retweet_count"
-	SortByReplyCount TweetSortField = "reply_count"
-)
-
-// TweetSortOrder defines sort order.
-type TweetSortOrder string
-
-const (
-	SortAsc  TweetSortOrder = "ASC"
-	SortDesc TweetSortOrder = "DESC"
-)
-
-// PaginationOptions for tweets.
-type TweetPagination struct {
-	Cursor   string          `json:"cursor"`
-	Limit    int             `json:"limit"`
-	SortBy   TweetSortField  `json:"sort_by"`
-	Order    TweetSortOrder  `json:"order"`
+// DayOfWeekRetweetCount represents retweet counts by day of week.
+type DayOfWeekRetweetCount struct {
+	Day   string `json:"day"`
+	Count int64  `json:"count"`
 }
 
-// DefaultTweetPagination returns default pagination options.
-func DefaultTweetPagination() *TweetPagination {
-	return &TweetPagination{
-		Limit: 20,
-		SortBy: SortByCreatedAt,
-		Order:  SortDesc,
-	}
+// RetweetChain represents a retweet chain.
+type RetweetChain struct {
+	RootTweetID string   `json:"root_tweet_id"`
+	Nodes       []*RetweetNode `json:"nodes"`
 }
 
-// Validate checks pagination parameters.
-func (p *TweetPagination) Validate() error {
-	if p.Limit < 1 || p.Limit > 100 {
-		return ErrInvalidLimit
-	}
-	return nil
+// RetweetNode represents a node in a retweet chain.
+type RetweetNode struct {
+	UserID      string    `json:"user_id"`
+	Username    string    `json:"username"`
+	RetweetedAt time.Time `json:"retweeted_at"`
+	Depth       int       `json:"depth"`
 }
 
 // ======================================================================
-= Error Helpers
+= Helper Functions
 // ======================================================================
 
-// IsTweetNotFound checks if an error indicates a tweet was not found.
-func IsTweetNotFound(err error) bool {
-	return errors.Is(err, ErrTweetNotFound) || errors.Is(err, ErrTweetDeleted)
-}
-
-// IsAlreadyLiked checks if an error indicates already liked.
-func IsAlreadyLiked(err error) bool {
-	return errors.Is(err, ErrAlreadyLiked)
+// IsRetweetNotFound checks if an error indicates a retweet was not found.
+func IsRetweetNotFound(err error) bool {
+	return errors.Is(err, ErrRetweetNotFound)
 }
 
 // IsAlreadyRetweeted checks if an error indicates already retweeted.
@@ -295,49 +364,543 @@ func IsAlreadyRetweeted(err error) bool {
 	return errors.Is(err, ErrAlreadyRetweeted)
 }
 
-// IsAlreadyBookmarked checks if an error indicates already bookmarked.
-func IsAlreadyBookmarked(err error) bool {
-	return errors.Is(err, ErrAlreadyBookmarked)
-}
-
-// IsPollError checks if an error is poll-related.
-func IsPollError(err error) bool {
-	return errors.Is(err, ErrPollExpired) ||
-		errors.Is(err, ErrPollAlreadyVoted) ||
-		errors.Is(err, ErrInvalidPollOption) ||
-		errors.Is(err, ErrPollNotFound)
+// IsRetweetError checks if an error is retweet-related.
+func IsRetweetError(err error) bool {
+	return errors.Is(err, ErrRetweetNotFound) ||
+		errors.Is(err, ErrAlreadyRetweeted) ||
+		errors.Is(err, ErrInvalidRetweetID) ||
+		errors.Is(err, ErrInvalidTweetID) ||
+		errors.Is(err, ErrInvalidUserID) ||
+		errors.Is(err, ErrCannotRetweetOwn)
 }
 
 // ======================================================================
-= Mock Repository (for testing)
+= Mock Retweet Repository (for testing)
 // ======================================================================
 
-// MockTweetRepository is a mock implementation for testing.
-type MockTweetRepository struct {
-	Tweets map[string]*entities.Tweet
-	Likes  map[string]map[string]bool // tweetID -> userID -> liked
-	Retweets map[string]map[string]bool // tweetID -> userID -> retweeted
-	Bookmarks map[string]map[string]bool // tweetID -> userID -> bookmarked
-	Polls  map[string]*entities.Poll
-	Error  error
+// MockRetweetRepository is a mock implementation for testing.
+type MockRetweetRepository struct {
+	Retweets      map[string]*entities.Retweet
+	TweetRetweets map[string]map[string]bool // tweetID -> userID -> retweeted
+	UserRetweets  map[string]map[string]bool // userID -> tweetID -> retweeted
+	Error         error
+	NextCursor    string
 }
 
-// NewMockTweetRepo creates a new mock repository.
-func NewMockTweetRepo() TweetRepository {
-	return &MockTweetRepository{
-		Tweets:    make(map[string]*entities.Tweet),
-		Likes:     make(map[string]map[string]bool),
-		Retweets:  make(map[string]map[string]bool),
-		Bookmarks: make(map[string]map[string]bool),
-		Polls:     make(map[string]*entities.Poll),
+// NewMockRetweetRepo creates a new mock repository.
+func NewMockRetweetRepo() RetweetRepository {
+	return &MockRetweetRepository{
+		Retweets:      make(map[string]*entities.Retweet),
+		TweetRetweets: make(map[string]map[string]bool),
+		UserRetweets:  make(map[string]map[string]bool),
 	}
 }
 
-// (Mock methods would be implemented here, but are omitted for brevity)
+// Create mock implementation.
+func (m *MockRetweetRepository) Create(ctx context.Context, retweet *entities.Retweet) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	if m.TweetRetweets[retweet.TweetID] != nil && m.TweetRetweets[retweet.TweetID][retweet.UserID] {
+		return ErrAlreadyRetweeted
+	}
+	m.Retweets[retweet.ID] = retweet
+	if m.TweetRetweets[retweet.TweetID] == nil {
+		m.TweetRetweets[retweet.TweetID] = make(map[string]bool)
+	}
+	m.TweetRetweets[retweet.TweetID][retweet.UserID] = true
+	if m.UserRetweets[retweet.UserID] == nil {
+		m.UserRetweets[retweet.UserID] = make(map[string]bool)
+	}
+	m.UserRetweets[retweet.UserID][retweet.TweetID] = true
+	return nil
+}
 
-// ======================================================================
-= Repository Factory
-// ======================================================================
+// GetByID mock implementation.
+func (m *MockRetweetRepository) GetByID(ctx context.Context, id string) (*entities.Retweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	if retweet, ok := m.Retweets[id]; ok {
+		return retweet, nil
+	}
+	return nil, ErrRetweetNotFound
+}
 
-// TweetRepositoryFactory is a function type for creating a repository with a specific DB connection.
-type TweetRepositoryFactory func(db interface{}) TweetRepository
+// GetByTweetAndUser mock implementation.
+func (m *MockRetweetRepository) GetByTweetAndUser(ctx context.Context, tweetID, userID string) (*entities.Retweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	for _, retweet := range m.Retweets {
+		if retweet.TweetID == tweetID && retweet.UserID == userID {
+			return retweet, nil
+		}
+	}
+	return nil, ErrRetweetNotFound
+}
+
+// Delete mock implementation.
+func (m *MockRetweetRepository) Delete(ctx context.Context, id string) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	if retweet, ok := m.Retweets[id]; ok {
+		delete(m.Retweets, id)
+		if m.TweetRetweets[retweet.TweetID] != nil {
+			delete(m.TweetRetweets[retweet.TweetID], retweet.UserID)
+		}
+		if m.UserRetweets[retweet.UserID] != nil {
+			delete(m.UserRetweets[retweet.UserID], retweet.TweetID)
+		}
+		return nil
+	}
+	return ErrRetweetNotFound
+}
+
+// DeleteByTweetAndUser mock implementation.
+func (m *MockRetweetRepository) DeleteByTweetAndUser(ctx context.Context, tweetID, userID string) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for id, retweet := range m.Retweets {
+		if retweet.TweetID == tweetID && retweet.UserID == userID {
+			delete(m.Retweets, id)
+			if m.TweetRetweets[tweetID] != nil {
+				delete(m.TweetRetweets[tweetID], userID)
+			}
+			if m.UserRetweets[userID] != nil {
+				delete(m.UserRetweets[userID], tweetID)
+			}
+			return nil
+		}
+	}
+	return ErrRetweetNotFound
+}
+
+// Exists mock implementation.
+func (m *MockRetweetRepository) Exists(ctx context.Context, tweetID, userID string) (bool, error) {
+	if m.Error != nil {
+		return false, m.Error
+	}
+	if m.TweetRetweets[tweetID] == nil {
+		return false, nil
+	}
+	return m.TweetRetweets[tweetID][userID], nil
+}
+
+// CountByTweetID mock implementation.
+func (m *MockRetweetRepository) CountByTweetID(ctx context.Context, tweetID string) (int64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	if m.TweetRetweets[tweetID] == nil {
+		return 0, nil
+	}
+	return int64(len(m.TweetRetweets[tweetID])), nil
+}
+
+// CountByUserID mock implementation.
+func (m *MockRetweetRepository) CountByUserID(ctx context.Context, userID string) (int64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	if m.UserRetweets[userID] == nil {
+		return 0, nil
+	}
+	return int64(len(m.UserRetweets[userID])), nil
+}
+
+// CountByTweetIDs mock implementation.
+func (m *MockRetweetRepository) CountByTweetIDs(ctx context.Context, tweetIDs []string) (map[string]int64, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	result := make(map[string]int64)
+	for _, id := range tweetIDs {
+		if m.TweetRetweets[id] != nil {
+			result[id] = int64(len(m.TweetRetweets[id]))
+		} else {
+			result[id] = 0
+		}
+	}
+	return result, nil
+}
+
+// CountByUserIDs mock implementation.
+func (m *MockRetweetRepository) CountByUserIDs(ctx context.Context, userIDs []string) (map[string]int64, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	result := make(map[string]int64)
+	for _, id := range userIDs {
+		if m.UserRetweets[id] != nil {
+			result[id] = int64(len(m.UserRetweets[id]))
+		} else {
+			result[id] = 0
+		}
+	}
+	return result, nil
+}
+
+// CountByDateRange mock implementation.
+func (m *MockRetweetRepository) CountByDateRange(ctx context.Context, start, end time.Time) (int64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	count := int64(0)
+	for _, retweet := range m.Retweets {
+		if retweet.CreatedAt.After(start) && retweet.CreatedAt.Before(end) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// CountByDateRangeForUser mock implementation.
+func (m *MockRetweetRepository) CountByDateRangeForUser(ctx context.Context, userID string, start, end time.Time) (int64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	count := int64(0)
+	for _, retweet := range m.Retweets {
+		if retweet.UserID == userID && retweet.CreatedAt.After(start) && retweet.CreatedAt.Before(end) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// GetByTweetID mock implementation.
+func (m *MockRetweetRepository) GetByTweetID(ctx context.Context, tweetID string, cursor string, limit int) ([]*entities.Retweet, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	var retweets []*entities.Retweet
+	for _, retweet := range m.Retweets {
+		if retweet.TweetID == tweetID {
+			retweets = append(retweets, retweet)
+		}
+	}
+	return retweets, "", nil
+}
+
+// GetByUserID mock implementation.
+func (m *MockRetweetRepository) GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Retweet, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	var retweets []*entities.Retweet
+	for _, retweet := range m.Retweets {
+		if retweet.UserID == userID {
+			retweets = append(retweets, retweet)
+		}
+	}
+	return retweets, "", nil
+}
+
+// GetRetweetedTweetIDs mock implementation.
+func (m *MockRetweetRepository) GetRetweetedTweetIDs(ctx context.Context, userID string) ([]string, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	var ids []string
+	for _, retweet := range m.Retweets {
+		if retweet.UserID == userID {
+			ids = append(ids, retweet.TweetID)
+		}
+	}
+	return ids, nil
+}
+
+// GetRetweetedTweets mock implementation.
+func (m *MockRetweetRepository) GetRetweetedTweets(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Tweet, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	return []*entities.Tweet{}, "", nil
+}
+
+// GetRetweeters mock implementation.
+func (m *MockRetweetRepository) GetRetweeters(ctx context.Context, tweetID string, cursor string, limit int) ([]*entities.User, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	return []*entities.User{}, "", nil
+}
+
+// GetRetweetersWithTime mock implementation.
+func (m *MockRetweetRepository) GetRetweetersWithTime(ctx context.Context, tweetID string, cursor string, limit int) ([]*RetweetWithUser, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	return []*RetweetWithUser{}, "", nil
+}
+
+// GetRetweetsTimeline mock implementation.
+func (m *MockRetweetRepository) GetRetweetsTimeline(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Retweet, string, error) {
+	if m.Error != nil {
+		return nil, "", m.Error
+	}
+	var retweets []*entities.Retweet
+	for _, retweet := range m.Retweets {
+		for _, uid := range userIDs {
+			if retweet.UserID == uid {
+				retweets = append(retweets, retweet)
+				break
+			}
+		}
+	}
+	return retweets, "", nil
+}
+
+// GetRecentRetweets mock implementation.
+func (m *MockRetweetRepository) GetRecentRetweets(ctx context.Context, userID string, limit int) ([]*entities.Retweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	var retweets []*entities.Retweet
+	for _, retweet := range m.Retweets {
+		if retweet.UserID == userID {
+			retweets = append(retweets, retweet)
+		}
+	}
+	return retweets, nil
+}
+
+// GetRecentRetweetsForTweets mock implementation.
+func (m *MockRetweetRepository) GetRecentRetweetsForTweets(ctx context.Context, tweetIDs []string, limit int) (map[string][]*entities.Retweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	result := make(map[string][]*entities.Retweet)
+	for _, tid := range tweetIDs {
+		var retweets []*entities.Retweet
+		for _, retweet := range m.Retweets {
+			if retweet.TweetID == tid {
+				retweets = append(retweets, retweet)
+			}
+		}
+		result[tid] = retweets
+	}
+	return result, nil
+}
+
+// GetMostRetweetedTweets mock implementation.
+func (m *MockRetweetRepository) GetMostRetweetedTweets(ctx context.Context, limit int, since time.Time) ([]*entities.Tweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*entities.Tweet{}, nil
+}
+
+// GetMostRetweetedTweetsByCategory mock implementation.
+func (m *MockRetweetRepository) GetMostRetweetedTweetsByCategory(ctx context.Context, category string, limit int, since time.Time) ([]*entities.Tweet, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*entities.Tweet{}, nil
+}
+
+// GetMostActiveRetweeters mock implementation.
+func (m *MockRetweetRepository) GetMostActiveRetweeters(ctx context.Context, limit int, since time.Time) ([]*RetweeterStats, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*RetweeterStats{}, nil
+}
+
+// GetRetweetsByHour mock implementation.
+func (m *MockRetweetRepository) GetRetweetsByHour(ctx context.Context, tweetID string) ([]*HourlyRetweetCount, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*HourlyRetweetCount{}, nil
+}
+
+// GetRetweetsByDayOfWeek mock implementation.
+func (m *MockRetweetRepository) GetRetweetsByDayOfWeek(ctx context.Context, tweetID string) ([]*DayOfWeekRetweetCount, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*DayOfWeekRetweetCount{}, nil
+}
+
+// GetRetweetChains mock implementation.
+func (m *MockRetweetRepository) GetRetweetChains(ctx context.Context, tweetID string, maxDepth int) ([]*RetweetChain, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*RetweetChain{}, nil
+}
+
+// BulkCreate mock implementation.
+func (m *MockRetweetRepository) BulkCreate(ctx context.Context, retweets []*entities.Retweet) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for _, retweet := range retweets {
+		if err := m.Create(ctx, retweet); err != nil && !errors.Is(err, ErrAlreadyRetweeted) {
+			return err
+		}
+	}
+	return nil
+}
+
+// BulkDelete mock implementation.
+func (m *MockRetweetRepository) BulkDelete(ctx context.Context, ids []string) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for _, id := range ids {
+		_ = m.Delete(ctx, id)
+	}
+	return nil
+}
+
+// BulkDeleteByTweetID mock implementation.
+func (m *MockRetweetRepository) BulkDeleteByTweetID(ctx context.Context, tweetID string) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for id, retweet := range m.Retweets {
+		if retweet.TweetID == tweetID {
+			delete(m.Retweets, id)
+			if m.TweetRetweets[tweetID] != nil {
+				delete(m.TweetRetweets[tweetID], retweet.UserID)
+			}
+			if m.UserRetweets[retweet.UserID] != nil {
+				delete(m.UserRetweets[retweet.UserID], tweetID)
+			}
+		}
+	}
+	return nil
+}
+
+// BulkDeleteByUserID mock implementation.
+func (m *MockRetweetRepository) BulkDeleteByUserID(ctx context.Context, userID string) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for id, retweet := range m.Retweets {
+		if retweet.UserID == userID {
+			delete(m.Retweets, id)
+			if m.TweetRetweets[retweet.TweetID] != nil {
+				delete(m.TweetRetweets[retweet.TweetID], userID)
+			}
+			if m.UserRetweets[userID] != nil {
+				delete(m.UserRetweets[userID], retweet.TweetID)
+			}
+		}
+	}
+	return nil
+}
+
+// BulkDeleteByTweetAndUser mock implementation.
+func (m *MockRetweetRepository) BulkDeleteByTweetAndUser(ctx context.Context, pairs []TweetUserPair) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	for _, pair := range pairs {
+		_ = m.DeleteByTweetAndUser(ctx, pair.TweetID, pair.UserID)
+	}
+	return nil
+}
+
+// GetRetweetStats mock implementation.
+func (m *MockRetweetRepository) GetRetweetStats(ctx context.Context) (*RetweetStats, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return &RetweetStats{
+		TotalRetweets: int64(len(m.Retweets)),
+	}, nil
+}
+
+// GetUserRetweetStats mock implementation.
+func (m *MockRetweetRepository) GetUserRetweetStats(ctx context.Context, userID string) (*RetweetStats, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	count := int64(0)
+	for _, retweet := range m.Retweets {
+		if retweet.UserID == userID {
+			count++
+		}
+	}
+	return &RetweetStats{TotalRetweets: count}, nil
+}
+
+// GetTweetRetweetStats mock implementation.
+func (m *MockRetweetRepository) GetTweetRetweetStats(ctx context.Context, tweetID string) (*RetweetStats, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	count := int64(0)
+	for _, retweet := range m.Retweets {
+		if retweet.TweetID == tweetID {
+			count++
+		}
+	}
+	return &RetweetStats{TotalRetweets: count}, nil
+}
+
+// GetDailyRetweetStats mock implementation.
+func (m *MockRetweetRepository) GetDailyRetweetStats(ctx context.Context, start, end time.Time) ([]*DailyRetweetCount, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*DailyRetweetCount{}, nil
+}
+
+// GetDailyRetweetStatsForUser mock implementation.
+func (m *MockRetweetRepository) GetDailyRetweetStatsForUser(ctx context.Context, userID string, start, end time.Time) ([]*DailyRetweetCount, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	return []*DailyRetweetCount{}, nil
+}
+
+// GetRetweetEngagementRate mock implementation.
+func (m *MockRetweetRepository) GetRetweetEngagementRate(ctx context.Context, tweetID string) (float64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	return 0.0, nil
+}
+
+// GetRetweetConversionRate mock implementation.
+func (m *MockRetweetRepository) GetRetweetConversionRate(ctx context.Context, tweetID string) (float64, error) {
+	if m.Error != nil {
+		return 0, m.Error
+	}
+	return 0.0, nil
+}
+
+// WithTransaction mock implementation.
+func (m *MockRetweetRepository) WithTransaction(ctx context.Context, tx *sql.Tx) RetweetRepository {
+	return m
+}
+
+// Transaction mock implementation.
+func (m *MockRetweetRepository) Transaction(ctx context.Context, fn func(txRepo RetweetRepository) error) error {
+	if m.Error != nil {
+		return m.Error
+	}
+	return fn(m)
+}
+
+// Ping mock implementation.
+func (m *MockRetweetRepository) Ping(ctx context.Context) error {
+	return m.Error
+}
+
+// Close mock implementation.
+func (m *MockRetweetRepository) Close() error {
+	return nil
+}
+
+// GetRawDB mock implementation.
+func (m *MockRetweetRepository) GetRawDB() interface{} {
+	return nil
+}
