@@ -137,7 +137,7 @@ type GroupedNotification struct {
 }
 
 // ======================================================================
-= NotificationRepository Interface
+// NotificationRepository Interface
 // ======================================================================
 
 // NotificationRepository defines the interface for notification data persistence.
@@ -356,7 +356,7 @@ type NotificationRepository interface {
 }
 
 // ======================================================================
-= Supporting Types
+// Supporting Types
 // ======================================================================
 
 // NotificationTypeStat represents notification statistics by type.
@@ -375,7 +375,7 @@ type TrendData struct {
 }
 
 // ======================================================================
-= Helper Functions
+// Helper Functions
 // ======================================================================
 
 // IsNotificationNotFound checks if an error indicates a notification was not found.
@@ -398,7 +398,7 @@ func IsNotificationError(err error) bool {
 }
 
 // ======================================================================
-= Mock Notification Repository (for testing)
+// Mock Notification Repository (for testing)
 // ======================================================================
 
 // MockNotificationRepository is a mock implementation for testing.
