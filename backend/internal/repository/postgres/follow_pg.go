@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 
 	"twitter-clone/backend/internal/domain/entities"
@@ -80,13 +81,24 @@ func (r *followRepo) getDB() sqlx.ExtContext {
 // Create inserts a new follow relationship.
 func (r *followRepo) Create(ctx context.Context, follow *entities.Follow) error {
 	query := `
-		INSERT INTO follows (id, follower_id, followee_id, created_at)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO follows (
+			id,
+			follower_id,
+			followee_id,
+			created_at
+		) VALUES ($1, $2, $3, $4)
 	`
 	_, err := r.getDB().ExecContext(ctx, query,
-		follow.ID, follow.FollowerID, follow.FolloweeID, follow.CreatedAt,
+		follow.ID,
+		follow.FollowerID,
+		follow.FolloweeID,
+		follow.CreatedAt,
 	)
 	if err != nil {
+		// Check for duplicate key violation
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return interfaces.ErrFollowAlreadyExists
+		}
 		return fmt.Errorf("create follow failed: %w", err)
 	}
 	return nil
@@ -108,7 +120,10 @@ func (r *followRepo) GetByID(ctx context.Context, id string) (*entities.Follow, 
 
 // GetByFollowerAndFollowee retrieves a follow by follower and followee IDs.
 func (r *followRepo) GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*entities.Follow, error) {
-	query := `SELECT * FROM follows WHERE follower_id = $1 AND followee_id = $2`
+	query := `
+		SELECT * FROM follows
+		WHERE follower_id = $1 AND followee_id = $2
+	`
 	var follow entities.Follow
 	err := r.getDB().GetContext(ctx, &follow, query, followerID, followeeID)
 	if err != nil {
@@ -120,7 +135,7 @@ func (r *followRepo) GetByFollowerAndFollowee(ctx context.Context, followerID, f
 	return &follow, nil
 }
 
-// Delete removes a follow relationship.
+// Delete removes a follow relationship by ID.
 func (r *followRepo) Delete(ctx context.Context, id string) error {
 	query := `DELETE FROM follows WHERE id = $1`
 	result, err := r.getDB().ExecContext(ctx, query, id)
@@ -154,7 +169,12 @@ func (r *followRepo) DeleteByFollowerAndFollowee(ctx context.Context, followerID
 
 // Exists checks if a follow relationship exists.
 func (r *followRepo) Exists(ctx context.Context, followerID, followeeID string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM follows WHERE follower_id = $1 AND followee_id = $2)`
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM follows
+			WHERE follower_id = $1 AND followee_id = $2
+		)
+	`
 	var exists bool
 	err := r.getDB().GetContext(ctx, &exists, query, followerID, followeeID)
 	if err != nil {
@@ -197,20 +217,14 @@ func (r *followRepo) CountFollowersByUserIDs(ctx context.Context, userIDs []stri
 	query := `
 		SELECT followee_id, COUNT(*) as count
 		FROM follows
-		WHERE followee_id IN (?)
+		WHERE followee_id = ANY($1)
 		GROUP BY followee_id
 	`
-	query, args, err := sqlx.In(query, userIDs)
-	if err != nil {
-		return nil, fmt.Errorf("build IN query failed: %w", err)
-	}
-	query = r.getDB().Rebind(query)
-
 	var results []struct {
 		FolloweeID string `db:"followee_id"`
 		Count      int64  `db:"count"`
 	}
-	err = r.getDB().SelectContext(ctx, &results, query, args...)
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
 	if err != nil {
 		return nil, fmt.Errorf("count followers by user IDs failed: %w", err)
 	}
@@ -230,20 +244,14 @@ func (r *followRepo) CountFollowingByUserIDs(ctx context.Context, userIDs []stri
 	query := `
 		SELECT follower_id, COUNT(*) as count
 		FROM follows
-		WHERE follower_id IN (?)
+		WHERE follower_id = ANY($1)
 		GROUP BY follower_id
 	`
-	query, args, err := sqlx.In(query, userIDs)
-	if err != nil {
-		return nil, fmt.Errorf("build IN query failed: %w", err)
-	}
-	query = r.getDB().Rebind(query)
-
 	var results []struct {
 		FollowerID string `db:"follower_id"`
 		Count      int64  `db:"count"`
 	}
-	err = r.getDB().SelectContext(ctx, &results, query, args...)
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
 	if err != nil {
 		return nil, fmt.Errorf("count following by user IDs failed: %w", err)
 	}
@@ -333,7 +341,11 @@ func (r *followRepo) GetFollowing(ctx context.Context, userID string, cursor str
 
 // GetFollowerIDs returns all follower IDs of a user.
 func (r *followRepo) GetFollowerIDs(ctx context.Context, userID string) ([]string, error) {
-	query := `SELECT follower_id FROM follows WHERE followee_id = $1 ORDER BY created_at DESC`
+	query := `
+		SELECT follower_id FROM follows
+		WHERE followee_id = $1
+		ORDER BY created_at DESC
+	`
 	var ids []string
 	err := r.getDB().SelectContext(ctx, &ids, query, userID)
 	if err != nil {
@@ -344,7 +356,11 @@ func (r *followRepo) GetFollowerIDs(ctx context.Context, userID string) ([]strin
 
 // GetFollowingIDs returns all user IDs a user is following.
 func (r *followRepo) GetFollowingIDs(ctx context.Context, userID string) ([]string, error) {
-	query := `SELECT followee_id FROM follows WHERE follower_id = $1 ORDER BY created_at DESC`
+	query := `
+		SELECT followee_id FROM follows
+		WHERE follower_id = $1
+		ORDER BY created_at DESC
+	`
 	var ids []string
 	err := r.getDB().SelectContext(ctx, &ids, query, userID)
 	if err != nil {
@@ -361,20 +377,14 @@ func (r *followRepo) GetFollowerIDsBatch(ctx context.Context, userIDs []string) 
 	query := `
 		SELECT followee_id, follower_id
 		FROM follows
-		WHERE followee_id IN (?)
+		WHERE followee_id = ANY($1)
 		ORDER BY created_at DESC
 	`
-	query, args, err := sqlx.In(query, userIDs)
-	if err != nil {
-		return nil, fmt.Errorf("build IN query failed: %w", err)
-	}
-	query = r.getDB().Rebind(query)
-
 	var results []struct {
 		FolloweeID string `db:"followee_id"`
 		FollowerID string `db:"follower_id"`
 	}
-	err = r.getDB().SelectContext(ctx, &results, query, args...)
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
 	if err != nil {
 		return nil, fmt.Errorf("get follower IDs batch failed: %w", err)
 	}
@@ -394,20 +404,14 @@ func (r *followRepo) GetFollowingIDsBatch(ctx context.Context, userIDs []string)
 	query := `
 		SELECT follower_id, followee_id
 		FROM follows
-		WHERE follower_id IN (?)
+		WHERE follower_id = ANY($1)
 		ORDER BY created_at DESC
 	`
-	query, args, err := sqlx.In(query, userIDs)
-	if err != nil {
-		return nil, fmt.Errorf("build IN query failed: %w", err)
-	}
-	query = r.getDB().Rebind(query)
-
 	var results []struct {
 		FollowerID string `db:"follower_id"`
 		FolloweeID string `db:"followee_id"`
 	}
-	err = r.getDB().SelectContext(ctx, &results, query, args...)
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
 	if err != nil {
 		return nil, fmt.Errorf("get following IDs batch failed: %w", err)
 	}
@@ -420,10 +424,10 @@ func (r *followRepo) GetFollowingIDsBatch(ctx context.Context, userIDs []string)
 }
 
 // ======================================================================
-= Mutual Follows
+// Mutual Follows
 // ======================================================================
 
-// GetMutualFollows returns users that two users both follow or both are followed by.
+// GetMutualFollows returns users that two users both follow.
 func (r *followRepo) GetMutualFollows(ctx context.Context, userID1, userID2 string) ([]string, error) {
 	query := `
 		SELECT followee_id
@@ -463,7 +467,7 @@ func (r *followRepo) IsMutualFollow(ctx context.Context, userID1, userID2 string
 }
 
 // ======================================================================
-= Bulk Operations
+// Bulk Operations
 // ======================================================================
 
 // BulkCreate inserts multiple follows in a single transaction.
@@ -478,8 +482,12 @@ func (r *followRepo) BulkCreate(ctx context.Context, follows []*entities.Follow)
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO follows (id, follower_id, followee_id, created_at)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO follows (
+			id,
+			follower_id,
+			followee_id,
+			created_at
+		) VALUES ($1, $2, $3, $4)
 	`)
 	if err != nil {
 		return err
@@ -487,8 +495,16 @@ func (r *followRepo) BulkCreate(ctx context.Context, follows []*entities.Follow)
 	defer stmt.Close()
 
 	for _, f := range follows {
-		_, err := stmt.ExecContext(ctx, f.ID, f.FollowerID, f.FolloweeID, f.CreatedAt)
+		_, err := stmt.ExecContext(ctx,
+			f.ID,
+			f.FollowerID,
+			f.FolloweeID,
+			f.CreatedAt,
+		)
 		if err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+				continue // Skip duplicates
+			}
 			return fmt.Errorf("bulk create follow failed: %w", err)
 		}
 	}
@@ -533,7 +549,7 @@ func (r *followRepo) BulkDeleteByFollowee(ctx context.Context, followeeID string
 }
 
 // ======================================================================
-= Advanced Queries
+// Advanced Queries
 // ======================================================================
 
 // GetTopFollowedUsers returns the most followed users.
@@ -591,29 +607,24 @@ func (r *followRepo) GetFollowTimeline(ctx context.Context, userIDs []string, cu
 	query := `
 		SELECT f.*
 		FROM follows f
-		WHERE f.follower_id IN (?)
+		WHERE f.follower_id = ANY($1)
 	`
 	if cursor != "" {
 		query += ` AND f.id > $2`
 	}
 	query += ` ORDER BY f.created_at DESC, f.id DESC LIMIT $?`
 
-	args := []interface{}{userIDs}
+	args := []interface{}{pq.Array(userIDs)}
 	argIndex := 2
 	if cursor != "" {
 		args = append(args, cursor)
 		argIndex = 3
 	}
 	args = append(args, limit)
-
-	query, args, err := sqlx.In(query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("build IN query failed: %w", err)
-	}
 	query = r.getDB().Rebind(query)
 
 	var follows []*entities.Follow
-	err = r.getDB().SelectContext(ctx, &follows, query, args...)
+	err := r.getDB().SelectContext(ctx, &follows, query, args...)
 	if err != nil {
 		return nil, "", fmt.Errorf("get follow timeline failed: %w", err)
 	}
