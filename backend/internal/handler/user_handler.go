@@ -17,17 +17,21 @@ import (
 	"twitter-clone/backend/internal/dto"
 	"twitter-clone/backend/internal/middleware"
 	"twitter-clone/backend/internal/service"
+	"twitter-clone/backend/internal/adapter"
 	"twitter-clone/backend/pkg/logger"
 )
 
 // UserHandler handles all user-related HTTP endpoints.
 type UserHandler struct {
-	userService    service.UserService
-	followService  service.FollowService
-	tweetService   service.TweetService
+	userService         service.UserService
+	followService       service.FollowService
+	tweetService        service.TweetService
 	notificationService service.NotificationService
-	searchService  service.SearchService
-	log            *logrus.Entry
+	searchService       service.SearchService
+	userRepo            interfaces.UserRepository
+	followRepo          interfaces.FollowRepository
+	redisAdapter        adapter.RedisAdapter
+	log                 *logrus.Entry
 }
 
 // NewUserHandler creates a new user handler.
@@ -37,19 +41,25 @@ func NewUserHandler(
 	tweetService service.TweetService,
 	notificationService service.NotificationService,
 	searchService service.SearchService,
+	userRepo interfaces.UserRepository,
+	followRepo interfaces.FollowRepository,
+	redisAdapter adapter.RedisAdapter,
 ) *UserHandler {
 	return &UserHandler{
-		userService:    userService,
-		followService:  followService,
-		tweetService:   tweetService,
+		userService:         userService,
+		followService:       followService,
+		tweetService:        tweetService,
 		notificationService: notificationService,
-		searchService:  searchService,
-		log:            logger.WithField("handler", "user"),
+		searchService:       searchService,
+		userRepo:            userRepo,
+		followRepo:          followRepo,
+		redisAdapter:        redisAdapter,
+		log:                 logger.WithField("handler", "user"),
 	}
 }
 
 // ======================================================================
-// Get Profile
+// Profile Operations
 // ======================================================================
 
 // GetProfile handles retrieving a user's profile.
@@ -59,6 +69,7 @@ func NewUserHandler(
 // @Produce json
 // @Param identifier path string true "Username or User ID"
 // @Success 200 {object} dto.UserProfileResponse
+// @Failure 400 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/users/{identifier} [get]
@@ -70,7 +81,16 @@ func (h *UserHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get current user ID if authenticated
+	// Check cache first
+	cacheKey := fmt.Sprintf("user_profile:%s", identifier)
+	if h.redisAdapter != nil {
+		var cached dto.UserProfileResponse
+		if err := h.redisAdapter.GetJSON(r.Context(), cacheKey, &cached); err == nil {
+			h.sendSuccess(w, http.StatusOK, cached)
+			return
+		}
+	}
+
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
 	profile, err := h.userService.GetProfile(r.Context(), identifier, currentUserID)
@@ -79,12 +99,13 @@ func (h *UserHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cache for 1 minute
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.CacheSet(r.Context(), cacheKey, profile, 1*time.Minute)
+	}
+
 	h.sendSuccess(w, http.StatusOK, profile)
 }
-
-// ======================================================================
-// Update Profile
-// ======================================================================
 
 // UpdateProfile handles updating a user's profile.
 // @Summary Update user profile
@@ -124,11 +145,88 @@ func (h *UserHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate cache
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", userID))
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", profile.Username))
+	}
+
 	h.sendSuccess(w, http.StatusOK, profile)
 }
 
+// UploadAvatar handles uploading a user's avatar.
+// @Summary Upload user avatar
+// @Description Uploads a new avatar image for the authenticated user
+// @Tags users
+// @Security BearerAuth
+// @Accept multipart/form-data
+// @Produce json
+// @Param avatar formData file true "Avatar image file"
+// @Success 200 {object} dto.UploadAvatarResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/users/avatar [post]
+func (h *UserHandler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	// Parse multipart form (max 5MB)
+	if err := r.ParseMultipartForm(5 << 20); err != nil {
+		h.sendError(w, http.StatusBadRequest, "Failed to parse form", nil)
+		return
+	}
+
+	file, header, err := r.FormFile("avatar")
+	if err != nil {
+		h.sendError(w, http.StatusBadRequest, "Avatar file is required", nil)
+		return
+	}
+	defer file.Close()
+
+	// Validate file type
+	contentType := header.Header.Get("Content-Type")
+	allowedTypes := []string{"image/jpeg", "image/png", "image/gif", "image/webp"}
+	allowed := false
+	for _, t := range allowedTypes {
+		if t == contentType {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		h.sendError(w, http.StatusBadRequest, "Only JPEG, PNG, GIF, and WEBP images are allowed", nil)
+		return
+	}
+
+	// Validate file size (max 5MB)
+	if header.Size > 5<<20 {
+		h.sendError(w, http.StatusBadRequest, "File size must be less than 5MB", nil)
+		return
+	}
+
+	avatarURL, err := h.userService.UploadAvatar(r.Context(), userID, file, header.Filename)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to upload avatar")
+		return
+	}
+
+	// Invalidate cache
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", userID))
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"avatar_url": avatarURL,
+		"message":    "Avatar uploaded successfully",
+	})
+}
+
 // ======================================================================
-= Follow/Unfollow
+// Follow/Unfollow
 // ======================================================================
 
 // Follow handles following a user.
@@ -166,6 +264,12 @@ func (h *UserHandler) Follow(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to follow user")
 		return
+	}
+
+	// Invalidate caches
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", targetID))
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", userID))
 	}
 
 	h.sendSuccess(w, http.StatusOK, result)
@@ -208,11 +312,17 @@ func (h *UserHandler) Unfollow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate caches
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", targetID))
+		_ = h.redisAdapter.Delete(r.Context(), fmt.Sprintf("user_profile:%s", userID))
+	}
+
 	h.sendSuccess(w, http.StatusOK, result)
 }
 
 // ======================================================================
-= Get Followers / Following
+= Followers / Following Lists
 // ======================================================================
 
 // GetFollowers handles retrieving a user's followers.
@@ -302,7 +412,7 @@ func (h *UserHandler) GetFollowing(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get User Tweets
+= User Tweets
 // ======================================================================
 
 // GetUserTweets handles retrieving a user's tweets.
@@ -350,8 +460,51 @@ func (h *UserHandler) GetUserTweets(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetUserLikedTweets handles retrieving a user's liked tweets.
+// @Summary Get user liked tweets
+// @Description Retrieves tweets liked by a specific user
+// @Tags users
+// @Produce json
+// @Param id path string true "User ID"
+// @Param cursor query string false "Pagination cursor"
+// @Param limit query int false "Items per page (default 20, max 100)"
+// @Success 200 {object} dto.TweetListResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/users/{id}/likes [get]
+func (h *UserHandler) GetUserLikedTweets(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userID := vars["id"]
+	if userID == "" {
+		h.sendError(w, http.StatusBadRequest, "User ID required", nil)
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 100 {
+		limit = 20
+	}
+
+	currentUserID, _ := middleware.GetUserID(r.Context())
+
+	tweets, nextCursor, total, err := h.tweetService.GetUserLikedTweets(r.Context(), userID, cursor, limit, currentUserID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get user liked tweets")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"data":        tweets,
+		"next_cursor": nextCursor,
+		"has_more":    nextCursor != "",
+		"limit":       limit,
+		"total":       total,
+	})
+}
+
 // ======================================================================
-= Get User Stats
+= User Stats
 // ======================================================================
 
 // GetUserStats handles retrieving a user's statistics.
@@ -372,17 +525,32 @@ func (h *UserHandler) GetUserStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check cache
+	cacheKey := fmt.Sprintf("user_stats:%s", userID)
+	if h.redisAdapter != nil {
+		var cached dto.UserStatsResponse
+		if err := h.redisAdapter.GetJSON(r.Context(), cacheKey, &cached); err == nil {
+			h.sendSuccess(w, http.StatusOK, cached)
+			return
+		}
+	}
+
 	stats, err := h.userService.GetUserStats(r.Context(), userID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get user stats")
 		return
 	}
 
+	// Cache for 5 minutes
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.CacheSet(r.Context(), cacheKey, stats, 5*time.Minute)
+	}
+
 	h.sendSuccess(w, http.StatusOK, stats)
 }
 
 // ======================================================================
-= Search Users
+= Search
 // ======================================================================
 
 // SearchUsers handles searching for users.
@@ -428,7 +596,7 @@ func (h *UserHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Suggestions
+= Suggestions
 // ======================================================================
 
 // GetSuggestions handles retrieving user suggestions.
@@ -454,10 +622,28 @@ func (h *UserHandler) GetSuggestions(w http.ResponseWriter, r *http.Request) {
 		limit = 10
 	}
 
+	// Check cache
+	cacheKey := fmt.Sprintf("suggestions:%s:%d", userID, limit)
+	if h.redisAdapter != nil {
+		var cached []*dto.UserSuggestionResponse
+		if err := h.redisAdapter.GetJSON(r.Context(), cacheKey, &cached); err == nil {
+			h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+				"suggestions": cached,
+				"limit":       limit,
+			})
+			return
+		}
+	}
+
 	suggestions, err := h.followService.GetSuggestions(r.Context(), userID, limit)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get suggestions")
 		return
+	}
+
+	// Cache for 10 minutes
+	if h.redisAdapter != nil {
+		_ = h.redisAdapter.CacheSet(r.Context(), cacheKey, suggestions, 10*time.Minute)
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
@@ -467,7 +653,7 @@ func (h *UserHandler) GetSuggestions(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Mutual Follows
+= Mutual Follows
 // ======================================================================
 
 // GetMutualFollows handles retrieving mutual follows.
@@ -520,7 +706,7 @@ func (h *UserHandler) GetMutualFollows(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Check Follow Status
+= Follow Status
 // ======================================================================
 
 // CheckFollowStatus handles checking if a user follows another.
@@ -563,7 +749,7 @@ func (h *UserHandler) CheckFollowStatus(w http.ResponseWriter, r *http.Request) 
 }
 
 // ======================================================================
-= Get Online Status
+= Online Status
 // ======================================================================
 
 // GetOnlineStatus handles checking if a user is online.
@@ -584,14 +770,124 @@ func (h *UserHandler) GetOnlineStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// This would need to check the WebSocket hub
-	// For now, return a placeholder
-	// In production, inject the WebSocket hub to check online status
+	// Check if user exists
+	_, err := h.userRepo.GetByID(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrUserNotFound) {
+			h.sendError(w, http.StatusNotFound, "User not found", nil)
+			return
+		}
+		h.handleServiceError(w, err, "Failed to check user")
+		return
+	}
+
+	// Check online status from Redis or WebSocket hub
+	isOnline := false
+	if h.redisAdapter != nil {
+		key := fmt.Sprintf("user_online:%s", userID)
+		val, err := h.redisAdapter.Get(r.Context(), key)
+		if err == nil && val == "online" {
+			isOnline = true
+		}
+	}
+
+	lastSeen, err := h.userService.GetLastSeen(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get last seen")
+		return
+	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"user_id":   userID,
-		"is_online": false,
-		"last_seen": time.Now().UTC().Format(time.RFC3339),
+		"is_online": isOnline,
+		"last_seen": lastSeen.Format(time.RFC3339),
+	})
+}
+
+// ======================================================================
+= Block/Unblock
+// ======================================================================
+
+// Block handles blocking a user.
+// @Summary Block a user
+// @Description Blocks the specified user
+// @Tags users
+// @Security BearerAuth
+// @Param id path string true "User ID to block"
+// @Success 200 {object} dto.BlockResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/users/{id}/block [post]
+func (h *UserHandler) Block(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	vars := mux.Vars(r)
+	targetID := vars["id"]
+	if targetID == "" {
+		h.sendError(w, http.StatusBadRequest, "User ID required", nil)
+		return
+	}
+
+	if userID == targetID {
+		h.sendError(w, http.StatusBadRequest, "Cannot block yourself", nil)
+		return
+	}
+
+	err = h.followService.Block(r.Context(), userID, targetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to block user")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"blocked": true,
+		"user_id": targetID,
+		"message": "User blocked successfully",
+	})
+}
+
+// Unblock handles unblocking a user.
+// @Summary Unblock a user
+// @Description Unblocks the specified user
+// @Tags users
+// @Security BearerAuth
+// @Param id path string true "User ID to unblock"
+// @Success 200 {object} dto.BlockResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/users/{id}/unblock [post]
+func (h *UserHandler) Unblock(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	vars := mux.Vars(r)
+	targetID := vars["id"]
+	if targetID == "" {
+		h.sendError(w, http.StatusBadRequest, "User ID required", nil)
+		return
+	}
+
+	err = h.followService.Unblock(r.Context(), userID, targetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to unblock user")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"blocked": false,
+		"user_id": targetID,
+		"message": "User unblocked successfully",
 	})
 }
 
@@ -647,6 +943,16 @@ func (h *UserHandler) handleServiceError(w http.ResponseWriter, err error, defau
 		h.sendError(w, http.StatusBadRequest, "Not following this user", nil)
 	case errors.Is(err, service.ErrCannotFollowSelf):
 		h.sendError(w, http.StatusBadRequest, "Cannot follow yourself", nil)
+	case errors.Is(err, service.ErrAlreadyBlocked):
+		h.sendError(w, http.StatusConflict, "User is already blocked", nil)
+	case errors.Is(err, service.ErrNotBlocked):
+		h.sendError(w, http.StatusBadRequest, "User is not blocked", nil)
+	case errors.Is(err, service.ErrInvalidUsername):
+		h.sendError(w, http.StatusBadRequest, "Invalid username", nil)
+	case errors.Is(err, service.ErrInvalidEmail):
+		h.sendError(w, http.StatusBadRequest, "Invalid email", nil)
+	case errors.Is(err, service.ErrProfileUpdateFailed):
+		h.sendError(w, http.StatusBadRequest, "Failed to update profile", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
@@ -655,4 +961,4 @@ func (h *UserHandler) handleServiceError(w http.ResponseWriter, err error, defau
 		h.log.WithError(err).Error(defaultMsg)
 		h.sendError(w, http.StatusInternalServerError, "Internal server error", nil)
 	}
-} 
+}
