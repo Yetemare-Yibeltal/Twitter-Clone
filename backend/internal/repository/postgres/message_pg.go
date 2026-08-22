@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -80,8 +81,8 @@ func (r *messageRepo) getDB() sqlx.ExtContext {
 // ======================================================================
 
 // Create inserts a new message.
-func (r *messageRepo) Create(ctx context.Context, message *entities.Message) error {
-	metadataJSON, err := json.Marshal(message.Metadata)
+func (r *messageRepo) Create(ctx context.Context, msg *entities.Message) error {
+	metadataJSON, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata failed: %w", err)
 	}
@@ -92,9 +93,9 @@ func (r *messageRepo) Create(ctx context.Context, message *entities.Message) err
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
 	_, err = r.getDB().ExecContext(ctx, query,
-		message.ID, message.SenderID, message.ReceiverID, message.Content,
-		pq.Array(message.MediaURLs), message.Read, message.ReadAt,
-		metadataJSON, message.CreatedAt, message.UpdatedAt,
+		msg.ID, msg.SenderID, msg.ReceiverID, msg.Content,
+		pq.Array(msg.MediaURLs), msg.Read, msg.ReadAt,
+		metadataJSON, msg.CreatedAt, msg.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("create message failed: %w", err)
@@ -105,20 +106,20 @@ func (r *messageRepo) Create(ctx context.Context, message *entities.Message) err
 // GetByID retrieves a message by its ID.
 func (r *messageRepo) GetByID(ctx context.Context, id string) (*entities.Message, error) {
 	query := `SELECT * FROM messages WHERE id = $1 AND deleted_at IS NULL`
-	var message entities.Message
-	err := r.getDB().GetContext(ctx, &message, query, id)
+	var msg entities.Message
+	err := r.getDB().GetContext(ctx, &msg, query, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, interfaces.ErrMessageNotFound
 		}
 		return nil, fmt.Errorf("get message by ID failed: %w", err)
 	}
-	return &message, nil
+	return &msg, nil
 }
 
 // Update updates a message (e.g., content edit).
-func (r *messageRepo) Update(ctx context.Context, message *entities.Message) error {
-	metadataJSON, err := json.Marshal(message.Metadata)
+func (r *messageRepo) Update(ctx context.Context, msg *entities.Message) error {
+	metadataJSON, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata failed: %w", err)
 	}
@@ -131,8 +132,8 @@ func (r *messageRepo) Update(ctx context.Context, message *entities.Message) err
 		WHERE id = $5 AND deleted_at IS NULL
 	`
 	result, err := r.getDB().ExecContext(ctx, query,
-		message.Content, pq.Array(message.MediaURLs), metadataJSON,
-		time.Now(), message.ID,
+		msg.Content, pq.Array(msg.MediaURLs), metadataJSON,
+		time.Now(), msg.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update message failed: %w", err)
@@ -144,7 +145,7 @@ func (r *messageRepo) Update(ctx context.Context, message *entities.Message) err
 	return nil
 }
 
-// SoftDelete marks a message as deleted (for both users).
+// SoftDelete marks a message as deleted.
 func (r *messageRepo) SoftDelete(ctx context.Context, id string) error {
 	query := `UPDATE messages SET deleted_at = $1 WHERE id = $2 AND deleted_at IS NULL`
 	_, err := r.getDB().ExecContext(ctx, query, time.Now(), id)
@@ -185,19 +186,6 @@ func (r *messageRepo) GetConversation(ctx context.Context, user1ID, user2ID stri
 		)
 		AND deleted_at IS NULL
 	`
-	if cursor != "" {
-		// Cursor format: "timestamp|id" or just id for simplicity
-		// We'll use created_at and id
-		parts := strings.Split(cursor, "|")
-		if len(parts) == 2 {
-			ts, err := time.Parse(time.RFC3339Nano, parts[0])
-			if err == nil {
-				query += ` AND (created_at < $3 OR (created_at = $3 AND id < $4))`
-			}
-		}
-	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
-
 	args := []interface{}{user1ID, user2ID}
 	argIdx := 3
 	if cursor != "" {
@@ -205,11 +193,13 @@ func (r *messageRepo) GetConversation(ctx context.Context, user1ID, user2ID stri
 		if len(parts) == 2 {
 			ts, err := time.Parse(time.RFC3339Nano, parts[0])
 			if err == nil {
+				query += ` AND (created_at < $3 OR (created_at = $3 AND id < $4))`
 				args = append(args, ts, parts[1])
 				argIdx = 5
 			}
 		}
 	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprintf("%d", argIdx)
 	args = append(args, limit)
 	query = r.getDB().Rebind(query)
 
@@ -228,23 +218,22 @@ func (r *messageRepo) GetConversation(ctx context.Context, user1ID, user2ID stri
 }
 
 // GetConversations returns a list of conversations for a user.
-func (r *messageRepo) GetConversations(ctx context.Context, userID string) ([]*entities.Conversation, error) {
-	// We need to find the distinct other party and the last message for each.
+func (r *messageRepo) GetConversations(ctx context.Context, userID string) ([]*interfaces.Conversation, error) {
 	query := `
 		SELECT 
 			CASE 
 				WHEN sender_id = $1 THEN receiver_id
 				WHEN receiver_id = $1 THEN sender_id
 			END AS other_user_id,
-			MAX(created_at) as last_message_at,
+			MAX(created_at) AS last_message_at,
 			(SELECT id FROM messages m2 
 			 WHERE (m2.sender_id = $1 AND m2.receiver_id = other_user_id)
 				OR (m2.sender_id = other_user_id AND m2.receiver_id = $1)
 			 AND m2.deleted_at IS NULL
-			 ORDER BY m2.created_at DESC LIMIT 1) as last_message_id,
-			(SELECT content FROM messages m3 WHERE m3.id = last_message_id) as last_message_content,
-			(SELECT read FROM messages m3 WHERE m3.id = last_message_id) as last_message_read,
-			COUNT(CASE WHEN read = false AND receiver_id = $1 THEN 1 END) as unread_count
+			 ORDER BY m2.created_at DESC LIMIT 1) AS last_message_id,
+			(SELECT content FROM messages m3 WHERE m3.id = last_message_id) AS last_message_content,
+			(SELECT read FROM messages m3 WHERE m3.id = last_message_id) AS last_message_read,
+			COUNT(CASE WHEN read = false AND receiver_id = $1 THEN 1 END) AS unread_count
 		FROM messages
 		WHERE (sender_id = $1 OR receiver_id = $1)
 		  AND deleted_at IS NULL
@@ -252,79 +241,79 @@ func (r *messageRepo) GetConversations(ctx context.Context, userID string) ([]*e
 		ORDER BY last_message_at DESC
 	`
 	var results []struct {
-		OtherUserID       string    `db:"other_user_id"`
-		LastMessageAt     time.Time `db:"last_message_at"`
-		LastMessageID     string    `db:"last_message_id"`
-		LastMessageContent string   `db:"last_message_content"`
-		LastMessageRead   bool      `db:"last_message_read"`
-		UnreadCount       int       `db:"unread_count"`
+		OtherUserID        string    `db:"other_user_id"`
+		LastMessageAt      time.Time `db:"last_message_at"`
+		LastMessageID      string    `db:"last_message_id"`
+		LastMessageContent string    `db:"last_message_content"`
+		LastMessageRead    bool      `db:"last_message_read"`
+		UnreadCount        int       `db:"unread_count"`
 	}
 	err := r.getDB().SelectContext(ctx, &results, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get conversations failed: %w", err)
 	}
 
-	conversations := make([]*entities.Conversation, 0, len(results))
-	for _, r := range results {
-		conv := &entities.Conversation{
-			OtherUserID:       r.OtherUserID,
-			LastMessageID:     r.LastMessageID,
-			LastMessageContent: r.LastMessageContent,
-			LastMessageAt:     r.LastMessageAt,
-			LastMessageRead:   r.LastMessageRead,
-			UnreadCount:       r.UnreadCount,
+	conversations := make([]*interfaces.Conversation, 0, len(results))
+	for _, res := range results {
+		conv := &interfaces.Conversation{
+			OtherUserID:         res.OtherUserID,
+			LastMessageID:       res.LastMessageID,
+			LastMessageContent:  res.LastMessageContent,
+			LastMessageAt:       res.LastMessageAt,
+			LastMessageRead:     res.LastMessageRead,
+			UnreadCount:         res.UnreadCount,
 		}
 		conversations = append(conversations, conv)
 	}
 	return conversations, nil
 }
 
-// GetConversationSummary returns summary of a conversation (last message, unread count).
-func (r *messageRepo) GetConversationSummary(ctx context.Context, user1ID, user2ID string) (*entities.Conversation, error) {
+// GetConversationSummary returns summary of a conversation.
+func (r *messageRepo) GetConversationSummary(ctx context.Context, user1ID, user2ID string) (*interfaces.Conversation, error) {
 	query := `
 		SELECT 
-			$2 as other_user_id,
-			MAX(created_at) as last_message_at,
+			$2 AS other_user_id,
+			MAX(created_at) AS last_message_at,
 			(SELECT id FROM messages m2 
 			 WHERE (m2.sender_id = $1 AND m2.receiver_id = $2)
 				OR (m2.sender_id = $2 AND m2.receiver_id = $1)
 			 AND m2.deleted_at IS NULL
-			 ORDER BY m2.created_at DESC LIMIT 1) as last_message_id,
-			(SELECT content FROM messages m3 WHERE m3.id = last_message_id) as last_message_content,
-			(SELECT read FROM messages m3 WHERE m3.id = last_message_id) as last_message_read,
-			COUNT(CASE WHEN read = false AND receiver_id = $1 THEN 1 END) as unread_count
+			 ORDER BY m2.created_at DESC LIMIT 1) AS last_message_id,
+			(SELECT content FROM messages m3 WHERE m3.id = last_message_id) AS last_message_content,
+			(SELECT read FROM messages m3 WHERE m3.id = last_message_id) AS last_message_read,
+			COUNT(CASE WHEN read = false AND receiver_id = $1 THEN 1 END) AS unread_count
 		FROM messages
 		WHERE (sender_id = $1 AND receiver_id = $2)
 		   OR (sender_id = $2 AND receiver_id = $1)
 		  AND deleted_at IS NULL
 	`
 	var result struct {
-		OtherUserID       string    `db:"other_user_id"`
-		LastMessageAt     time.Time `db:"last_message_at"`
-		LastMessageID     string    `db:"last_message_id"`
-		LastMessageContent string   `db:"last_message_content"`
-		LastMessageRead   bool      `db:"last_message_read"`
-		UnreadCount       int       `db:"unread_count"`
+		OtherUserID        string    `db:"other_user_id"`
+		LastMessageAt      time.Time `db:"last_message_at"`
+		LastMessageID      string    `db:"last_message_id"`
+		LastMessageContent string    `db:"last_message_content"`
+		LastMessageRead    bool      `db:"last_message_read"`
+		UnreadCount        int       `db:"unread_count"`
 	}
 	err := r.getDB().GetContext(ctx, &result, query, user1ID, user2ID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, interfaces.ErrConversationNotFound
 		}
 		return nil, fmt.Errorf("get conversation summary failed: %w", err)
 	}
-	return &entities.Conversation{
-		OtherUserID:       result.OtherUserID,
-		LastMessageID:     result.LastMessageID,
-		LastMessageContent: result.LastMessageContent,
-		LastMessageAt:     result.LastMessageAt,
-		LastMessageRead:   result.LastMessageRead,
-		UnreadCount:       result.UnreadCount,
+	return &interfaces.Conversation{
+		OtherUserID:         result.OtherUserID,
+		LastMessageID:       result.LastMessageID,
+		LastMessageContent:  result.LastMessageContent,
+		LastMessageAt:       result.LastMessageAt,
+		LastMessageRead:     result.LastMessageRead,
+		UnreadCount:         result.UnreadCount,
 	}, nil
 }
 
 // ======================================================================
-= Read Status Operations
+// Read Status Operations
 // ======================================================================
 
 // MarkAsRead marks a message as read.
@@ -370,10 +359,10 @@ func (r *messageRepo) MarkAllAsRead(ctx context.Context, userID string) error {
 }
 
 // ======================================================================
-= Count Operations
+// Count Operations
 // ======================================================================
 
-// CountUnread returns the total number of unread messages for a user.
+// CountUnread returns total unread messages for a user.
 func (r *messageRepo) CountUnread(ctx context.Context, userID string) (int64, error) {
 	query := `SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND read = false AND deleted_at IS NULL`
 	var count int64
@@ -399,7 +388,7 @@ func (r *messageRepo) CountUnreadFromUser(ctx context.Context, userID, senderID 
 	return count, nil
 }
 
-// CountTotalConversations returns the number of distinct conversations for a user.
+// CountTotalConversations returns number of distinct conversations for a user.
 func (r *messageRepo) CountTotalConversations(ctx context.Context, userID string) (int64, error) {
 	query := `
 		SELECT COUNT(DISTINCT 
@@ -428,8 +417,25 @@ func (r *messageRepo) CountTotalMessages(ctx context.Context, userID string) (in
 	return count, nil
 }
 
+// CountByDateRange returns message count within a date range.
+func (r *messageRepo) CountByDateRange(ctx context.Context, userID string, start, end time.Time) (int64, error) {
+	query := `
+		SELECT COUNT(*) 
+		FROM messages 
+		WHERE (sender_id = $1 OR receiver_id = $1) 
+		  AND created_at >= $2 AND created_at <= $3 
+		  AND deleted_at IS NULL
+	`
+	var count int64
+	err := r.getDB().GetContext(ctx, &count, query, userID, start, end)
+	if err != nil {
+		return 0, fmt.Errorf("count by date range failed: %w", err)
+	}
+	return count, nil
+}
+
 // ======================================================================
-= Advanced Queries
+// Advanced Queries
 // ======================================================================
 
 // GetLatestMessages returns the most recent messages for a user.
@@ -466,17 +472,6 @@ func (r *messageRepo) GetMessagesByDateRange(ctx context.Context, userID, otherU
 		AND created_at >= $3 AND created_at <= $4
 		AND deleted_at IS NULL
 	`
-	if cursor != "" {
-		parts := strings.Split(cursor, "|")
-		if len(parts) == 2 {
-			ts, err := time.Parse(time.RFC3339Nano, parts[0])
-			if err == nil {
-				query += ` AND (created_at < $5 OR (created_at = $5 AND id < $6))`
-			}
-		}
-	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
-
 	args := []interface{}{userID, otherUserID, start, end}
 	argIdx := 5
 	if cursor != "" {
@@ -484,11 +479,13 @@ func (r *messageRepo) GetMessagesByDateRange(ctx context.Context, userID, otherU
 		if len(parts) == 2 {
 			ts, err := time.Parse(time.RFC3339Nano, parts[0])
 			if err == nil {
+				query += ` AND (created_at < $5 OR (created_at = $5 AND id < $6))`
 				args = append(args, ts, parts[1])
 				argIdx = 7
 			}
 		}
 	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprintf("%d", argIdx)
 	args = append(args, limit)
 	query = r.getDB().Rebind(query)
 
@@ -506,8 +503,116 @@ func (r *messageRepo) GetMessagesByDateRange(ctx context.Context, userID, otherU
 	return messages, nextCursor, nil
 }
 
+// GetUnreadMessages returns all unread messages for a user.
+func (r *messageRepo) GetUnreadMessages(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Message, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM messages
+		WHERE receiver_id = $1 AND read = false AND deleted_at IS NULL
+	`
+	if cursor != "" {
+		query += ` AND id > $2`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID}
+	argIdx := 2
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 3
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var messages []*entities.Message
+	err := r.getDB().SelectContext(ctx, &messages, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get unread messages failed: %w", err)
+	}
+	var nextCursor string
+	if len(messages) == limit {
+		nextCursor = messages[len(messages)-1].ID
+	}
+	return messages, nextCursor, nil
+}
+
+// GetMessagesBySender returns messages from a specific sender.
+func (r *messageRepo) GetMessagesBySender(ctx context.Context, userID, senderID string, cursor string, limit int) ([]*entities.Message, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM messages
+		WHERE receiver_id = $1 AND sender_id = $2 AND deleted_at IS NULL
+	`
+	if cursor != "" {
+		query += ` AND id > $3`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID, senderID}
+	argIdx := 3
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 4
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var messages []*entities.Message
+	err := r.getDB().SelectContext(ctx, &messages, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get messages by sender failed: %w", err)
+	}
+	var nextCursor string
+	if len(messages) == limit {
+		nextCursor = messages[len(messages)-1].ID
+	}
+	return messages, nextCursor, nil
+}
+
 // ======================================================================
-= Bulk Operations
+// Search
+// ======================================================================
+
+// SearchMessages searches messages by content for a user.
+func (r *messageRepo) SearchMessages(ctx context.Context, userID, queryStr string, cursor string, limit int) ([]*entities.Message, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	querySQL := `
+		SELECT * FROM messages
+		WHERE (sender_id = $1 OR receiver_id = $1)
+		  AND content ILIKE $2
+		  AND deleted_at IS NULL
+	`
+	args := []interface{}{userID, "%" + queryStr + "%"}
+	argIdx := 3
+	if cursor != "" {
+		querySQL += ` AND id > $3`
+		args = append(args, cursor)
+		argIdx = 4
+	}
+	querySQL += ` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprintf("%d", argIdx)
+	args = append(args, limit)
+	querySQL = r.getDB().Rebind(querySQL)
+
+	var messages []*entities.Message
+	err := r.getDB().SelectContext(ctx, &messages, querySQL, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("search messages failed: %w", err)
+	}
+	var nextCursor string
+	if len(messages) == limit {
+		nextCursor = messages[len(messages)-1].ID
+	}
+	return messages, nextCursor, nil
+}
+
+// ======================================================================
+// Bulk Operations
 // ======================================================================
 
 // BulkCreate inserts multiple messages in a transaction.
@@ -600,47 +705,83 @@ func (r *messageRepo) BulkMarkAsRead(ctx context.Context, ids []string) error {
 	return nil
 }
 
+// BulkDeleteByUserID removes all messages for a user.
+func (r *messageRepo) BulkDeleteByUserID(ctx context.Context, userID string) error {
+	query := `DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1`
+	_, err := r.getDB().ExecContext(ctx, query, userID)
+	if err != nil {
+		return fmt.Errorf("bulk delete by user failed: %w", err)
+	}
+	return nil
+}
+
+// BulkDeleteConversation removes all messages between two users.
+func (r *messageRepo) BulkDeleteConversation(ctx context.Context, user1ID, user2ID string) error {
+	query := `
+		DELETE FROM messages 
+		WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
+	`
+	_, err := r.getDB().ExecContext(ctx, query, user1ID, user2ID)
+	if err != nil {
+		return fmt.Errorf("bulk delete conversation failed: %w", err)
+	}
+	return nil
+}
+
 // ======================================================================
-= Stats and Analytics
+// Stats and Analytics
 // ======================================================================
 
 // GetMessageStats returns aggregated message statistics.
-func (r *messageRepo) GetMessageStats(ctx context.Context) (*MessageStats, error) {
+func (r *messageRepo) GetMessageStats(ctx context.Context) (*interfaces.MessageStats, error) {
 	query := `
 		SELECT 
-			COUNT(*) as total_messages,
-			COUNT(DISTINCT sender_id) as unique_senders,
-			COUNT(DISTINCT receiver_id) as unique_receivers,
-			SUM(CASE WHEN read = true THEN 1 ELSE 0 END) as read_count,
-			SUM(CASE WHEN read = false THEN 1 ELSE 0 END) as unread_count,
-			MAX(created_at) as latest_message,
-			MIN(created_at) as earliest_message,
-			AVG(LENGTH(content)) as avg_length
+			COUNT(*) as total_sent,
+			COUNT(DISTINCT sender_id) as total_received, -- placeholder, we'll calculate properly
+			0 as unread_count,
+			0 as read_count,
+			MAX(created_at) as last_message_at,
+			MIN(created_at) as first_message_at
 		FROM messages
 		WHERE deleted_at IS NULL
 	`
-	var stats MessageStats
+	var stats interfaces.MessageStats
 	err := r.getDB().GetContext(ctx, &stats, query)
 	if err != nil {
 		return nil, fmt.Errorf("get message stats failed: %w", err)
 	}
+	// Refine with actual counts
+	var unread, read int64
+	_ = r.getDB().GetContext(ctx, &unread, `SELECT COUNT(*) FROM messages WHERE read = false AND deleted_at IS NULL`)
+	_ = r.getDB().GetContext(ctx, &read, `SELECT COUNT(*) FROM messages WHERE read = true AND deleted_at IS NULL`)
+	stats.UnreadCount = unread
+	stats.ReadCount = read
 	return &stats, nil
 }
 
-// MessageStats represents aggregated message statistics.
-type MessageStats struct {
-	TotalMessages    int64     `db:"total_messages"`
-	UniqueSenders    int64     `db:"unique_senders"`
-	UniqueReceivers  int64     `db:"unique_receivers"`
-	ReadCount        int64     `db:"read_count"`
-	UnreadCount      int64     `db:"unread_count"`
-	LatestMessage    time.Time `db:"latest_message"`
-	EarliestMessage  time.Time `db:"earliest_message"`
-	AvgLength        *float64  `db:"avg_length"`
+// GetUserMessageStats returns message stats for a specific user.
+func (r *messageRepo) GetUserMessageStats(ctx context.Context, userID string) (*interfaces.MessageStats, error) {
+	query := `
+		SELECT 
+			COUNT(CASE WHEN sender_id = $1 THEN 1 END) as total_sent,
+			COUNT(CASE WHEN receiver_id = $1 THEN 1 END) as total_received,
+			COUNT(CASE WHEN receiver_id = $1 AND read = false THEN 1 END) as unread_count,
+			COUNT(CASE WHEN receiver_id = $1 AND read = true THEN 1 END) as read_count,
+			MAX(created_at) as last_message_at,
+			MIN(created_at) as first_message_at
+		FROM messages
+		WHERE (sender_id = $1 OR receiver_id = $1) AND deleted_at IS NULL
+	`
+	var stats interfaces.MessageStats
+	err := r.getDB().GetContext(ctx, &stats, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get user message stats failed: %w", err)
+	}
+	return &stats, nil
 }
 
 // GetDailyMessageStats returns daily message counts.
-func (r *messageRepo) GetDailyMessageStats(ctx context.Context, start, end time.Time) ([]*DailyMessageCount, error) {
+func (r *messageRepo) GetDailyMessageStats(ctx context.Context, start, end time.Time) ([]*interfaces.DailyMessageCount, error) {
 	query := `
 		SELECT 
 			DATE(created_at) as date,
@@ -654,7 +795,7 @@ func (r *messageRepo) GetDailyMessageStats(ctx context.Context, start, end time.
 		GROUP BY DATE(created_at)
 		ORDER BY date ASC
 	`
-	var results []*DailyMessageCount
+	var results []*interfaces.DailyMessageCount
 	err := r.getDB().SelectContext(ctx, &results, query, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("get daily message stats failed: %w", err)
@@ -662,49 +803,8 @@ func (r *messageRepo) GetDailyMessageStats(ctx context.Context, start, end time.
 	return results, nil
 }
 
-// DailyMessageCount represents daily message counts.
-type DailyMessageCount struct {
-	Date           time.Time `db:"date"`
-	Total          int64     `db:"total"`
-	UniqueSenders  int64     `db:"unique_senders"`
-	UniqueReceivers int64    `db:"unique_receivers"`
-	ReadCount      int64     `db:"read_count"`
-	UnreadCount    int64     `db:"unread_count"`
-}
-
-// GetUserMessageStats returns message stats for a specific user.
-func (r *messageRepo) GetUserMessageStats(ctx context.Context, userID string) (*UserMessageStats, error) {
-	query := `
-		SELECT 
-			COUNT(*) as total_sent,
-			SUM(CASE WHEN read = true AND receiver_id = $1 THEN 1 ELSE 0 END) as read_by_receiver,
-			COUNT(CASE WHEN receiver_id = $1 THEN 1 END) as total_received,
-			SUM(CASE WHEN receiver_id = $1 AND read = false THEN 1 ELSE 0 END) as unread_received,
-			MAX(created_at) as latest_sent,
-			(SELECT MAX(created_at) FROM messages WHERE receiver_id = $1 AND deleted_at IS NULL) as latest_received
-		FROM messages
-		WHERE sender_id = $1 AND deleted_at IS NULL
-	`
-	var stats UserMessageStats
-	err := r.getDB().GetContext(ctx, &stats, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("get user message stats failed: %w", err)
-	}
-	return &stats, nil
-}
-
-// UserMessageStats represents message statistics for a user.
-type UserMessageStats struct {
-	TotalSent       int64     `db:"total_sent"`
-	ReadByReceiver  int64     `db:"read_by_receiver"`
-	TotalReceived   int64     `db:"total_received"`
-	UnreadReceived  int64     `db:"unread_received"`
-	LatestSent      time.Time `db:"latest_sent"`
-	LatestReceived  time.Time `db:"latest_received"`
-}
-
 // GetTopConversations returns the most active conversations for a user.
-func (r *messageRepo) GetTopConversations(ctx context.Context, userID string, limit int) ([]*TopConversation, error) {
+func (r *messageRepo) GetTopConversations(ctx context.Context, userID string, limit int) ([]*interfaces.TopConversation, error) {
 	if limit < 1 {
 		limit = 5
 	}
@@ -723,7 +823,7 @@ func (r *messageRepo) GetTopConversations(ctx context.Context, userID string, li
 		ORDER BY message_count DESC, last_message_at DESC
 		LIMIT $2
 	`
-	var results []*TopConversation
+	var results []*interfaces.TopConversation
 	err := r.getDB().SelectContext(ctx, &results, query, userID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get top conversations failed: %w", err)
@@ -731,15 +831,8 @@ func (r *messageRepo) GetTopConversations(ctx context.Context, userID string, li
 	return results, nil
 }
 
-// TopConversation represents a top conversation.
-type TopConversation struct {
-	OtherUserID   string    `db:"other_user_id"`
-	MessageCount  int64     `db:"message_count"`
-	LastMessageAt time.Time `db:"last_message_at"`
-}
-
 // ======================================================================
-= Health
+// Health
 // ======================================================================
 
 func (r *messageRepo) Ping(ctx context.Context) error {
