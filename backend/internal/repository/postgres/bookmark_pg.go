@@ -81,23 +81,16 @@ func (r *bookmarkRepo) getDB() sqlx.ExtContext {
 // Create inserts a new bookmark.
 func (r *bookmarkRepo) Create(ctx context.Context, bookmark *entities.Bookmark) error {
 	query := `
-		INSERT INTO bookmarks (
-			id,
-			tweet_id,
-			user_id,
-			created_at
-		) VALUES ($1, $2, $3, $4)
+		INSERT INTO bookmarks (id, tweet_id, user_id, created_at)
+		VALUES ($1, $2, $3, $4)
 	`
 	_, err := r.getDB().ExecContext(ctx, query,
-		bookmark.ID,
-		bookmark.TweetID,
-		bookmark.UserID,
-		bookmark.CreatedAt,
+		bookmark.ID, bookmark.TweetID, bookmark.UserID, bookmark.CreatedAt,
 	)
 	if err != nil {
-		// Check for duplicate key violation
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			return interfaces.ErrBookmarkAlreadyExists
+		// Check for duplicate key violation (PostgreSQL error code 23505)
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return interfaces.ErrAlreadyBookmarked
 		}
 		return fmt.Errorf("create bookmark failed: %w", err)
 	}
@@ -118,12 +111,9 @@ func (r *bookmarkRepo) GetByID(ctx context.Context, id string) (*entities.Bookma
 	return &bookmark, nil
 }
 
-// GetByTweetAndUser retrieves a bookmark by tweet and user.
+// GetByTweetAndUser retrieves a bookmark by tweet ID and user ID.
 func (r *bookmarkRepo) GetByTweetAndUser(ctx context.Context, tweetID, userID string) (*entities.Bookmark, error) {
-	query := `
-		SELECT * FROM bookmarks
-		WHERE tweet_id = $1 AND user_id = $2
-	`
+	query := `SELECT * FROM bookmarks WHERE tweet_id = $1 AND user_id = $2`
 	var bookmark entities.Bookmark
 	err := r.getDB().GetContext(ctx, &bookmark, query, tweetID, userID)
 	if err != nil {
@@ -135,7 +125,7 @@ func (r *bookmarkRepo) GetByTweetAndUser(ctx context.Context, tweetID, userID st
 	return &bookmark, nil
 }
 
-// Delete removes a bookmark by ID.
+// Delete removes a bookmark.
 func (r *bookmarkRepo) Delete(ctx context.Context, id string) error {
 	query := `DELETE FROM bookmarks WHERE id = $1`
 	result, err := r.getDB().ExecContext(ctx, query, id)
@@ -167,14 +157,9 @@ func (r *bookmarkRepo) DeleteByTweetAndUser(ctx context.Context, tweetID, userID
 // Existence Checks
 // ======================================================================
 
-// Exists checks if a bookmark exists for a tweet and user.
+// Exists checks if a user has bookmarked a tweet.
 func (r *bookmarkRepo) Exists(ctx context.Context, tweetID, userID string) (bool, error) {
-	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM bookmarks
-			WHERE tweet_id = $1 AND user_id = $2
-		)
-	`
+	query := `SELECT EXISTS(SELECT 1 FROM bookmarks WHERE tweet_id = $1 AND user_id = $2)`
 	var exists bool
 	err := r.getDB().GetContext(ctx, &exists, query, tweetID, userID)
 	if err != nil {
@@ -217,14 +202,20 @@ func (r *bookmarkRepo) CountByTweetIDs(ctx context.Context, tweetIDs []string) (
 	query := `
 		SELECT tweet_id, COUNT(*) as count
 		FROM bookmarks
-		WHERE tweet_id = ANY($1)
+		WHERE tweet_id IN (?)
 		GROUP BY tweet_id
 	`
+	query, args, err := sqlx.In(query, tweetIDs)
+	if err != nil {
+		return nil, fmt.Errorf("build IN query failed: %w", err)
+	}
+	query = r.getDB().Rebind(query)
+
 	var results []struct {
 		TweetID string `db:"tweet_id"`
 		Count   int64  `db:"count"`
 	}
-	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(tweetIDs))
+	err = r.getDB().SelectContext(ctx, &results, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("count bookmarks by tweet IDs failed: %w", err)
 	}
@@ -314,11 +305,7 @@ func (r *bookmarkRepo) GetByUserID(ctx context.Context, userID string, cursor st
 
 // GetBookmarkedTweetIDs returns all tweet IDs bookmarked by a user.
 func (r *bookmarkRepo) GetBookmarkedTweetIDs(ctx context.Context, userID string) ([]string, error) {
-	query := `
-		SELECT tweet_id FROM bookmarks
-		WHERE user_id = $1
-		ORDER BY created_at DESC
-	`
+	query := `SELECT tweet_id FROM bookmarks WHERE user_id = $1 ORDER BY created_at DESC`
 	var tweetIDs []string
 	err := r.getDB().SelectContext(ctx, &tweetIDs, query, userID)
 	if err != nil {
@@ -327,7 +314,11 @@ func (r *bookmarkRepo) GetBookmarkedTweetIDs(ctx context.Context, userID string)
 	return tweetIDs, nil
 }
 
-// GetBookmarkedTweets returns full tweet objects for bookmarks with pagination.
+// ======================================================================
+// Bookmarked Tweets with Join
+// ======================================================================
+
+// GetBookmarkedTweets returns full tweet objects for bookmarks by a user.
 func (r *bookmarkRepo) GetBookmarkedTweets(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Tweet, string, error) {
 	if limit < 1 {
 		limit = 20
@@ -335,12 +326,12 @@ func (r *bookmarkRepo) GetBookmarkedTweets(ctx context.Context, userID string, c
 	query := `
 		SELECT t.*
 		FROM tweets t
-		JOIN bookmarks b ON t.id = b.tweet_id
+		INNER JOIN bookmarks b ON t.id = b.tweet_id
 		WHERE b.user_id = $1
 		  AND t.deleted_at IS NULL
 	`
 	if cursor != "" {
-		query += ` AND t.id < $2`
+		query += ` AND t.id > $2`
 	}
 	query += ` ORDER BY b.created_at DESC, t.id DESC LIMIT $?`
 
@@ -366,7 +357,7 @@ func (r *bookmarkRepo) GetBookmarkedTweets(ctx context.Context, userID string, c
 	return tweets, nextCursor, nil
 }
 
-// GetBookmarkedTweetsWithMetadata returns tweets with bookmark metadata.
+// GetBookmarkedTweetsWithMetadata returns bookmarks with tweet data and bookmark metadata.
 func (r *bookmarkRepo) GetBookmarkedTweetsWithMetadata(ctx context.Context, userID string, cursor string, limit int) ([]*BookmarkedTweet, string, error) {
 	if limit < 1 {
 		limit = 20
@@ -377,14 +368,14 @@ func (r *bookmarkRepo) GetBookmarkedTweetsWithMetadata(ctx context.Context, user
 			b.id as bookmark_id,
 			b.created_at as bookmarked_at
 		FROM tweets t
-		JOIN bookmarks b ON t.id = b.tweet_id
+		INNER JOIN bookmarks b ON t.id = b.tweet_id
 		WHERE b.user_id = $1
 		  AND t.deleted_at IS NULL
 	`
 	if cursor != "" {
-		query += ` AND t.id < $2`
+		query += ` AND b.id > $2`
 	}
-	query += ` ORDER BY b.created_at DESC, t.id DESC LIMIT $?`
+	query += ` ORDER BY b.created_at DESC, b.id DESC LIMIT $?`
 
 	args := []interface{}{userID}
 	argIndex := 2
@@ -403,20 +394,20 @@ func (r *bookmarkRepo) GetBookmarkedTweetsWithMetadata(ctx context.Context, user
 
 	var nextCursor string
 	if len(results) == limit {
-		nextCursor = results[len(results)-1].Tweet.ID
+		nextCursor = results[len(results)-1].BookmarkID
 	}
 	return results, nextCursor, nil
 }
 
-// BookmarkedTweet extends Tweet with bookmark metadata.
+// BookmarkedTweet represents a tweet with bookmark metadata.
 type BookmarkedTweet struct {
 	entities.Tweet
-	BookmarkID   string    `db:"bookmark_id"`
+	BookmarkID  string    `db:"bookmark_id"`
 	BookmarkedAt time.Time `db:"bookmarked_at"`
 }
 
 // ======================================================================
-// Bulk Operations
+= Bulk Operations
 // ======================================================================
 
 // BulkCreate inserts multiple bookmarks in a single transaction.
@@ -431,12 +422,8 @@ func (r *bookmarkRepo) BulkCreate(ctx context.Context, bookmarks []*entities.Boo
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO bookmarks (
-			id,
-			tweet_id,
-			user_id,
-			created_at
-		) VALUES ($1, $2, $3, $4)
+		INSERT INTO bookmarks (id, tweet_id, user_id, created_at)
+		VALUES ($1, $2, $3, $4)
 	`)
 	if err != nil {
 		return err
@@ -444,16 +431,8 @@ func (r *bookmarkRepo) BulkCreate(ctx context.Context, bookmarks []*entities.Boo
 	defer stmt.Close()
 
 	for _, b := range bookmarks {
-		_, err := stmt.ExecContext(ctx,
-			b.ID,
-			b.TweetID,
-			b.UserID,
-			b.CreatedAt,
-		)
+		_, err := stmt.ExecContext(ctx, b.ID, b.TweetID, b.UserID, b.CreatedAt)
 		if err != nil {
-			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-				continue // Skip duplicates
-			}
 			return fmt.Errorf("bulk create bookmark failed: %w", err)
 		}
 	}
@@ -497,28 +476,11 @@ func (r *bookmarkRepo) BulkDeleteByUserID(ctx context.Context, userID string) er
 	return nil
 }
 
-// BulkDeleteByTweetIDs removes bookmarks for multiple tweets.
-func (r *bookmarkRepo) BulkDeleteByTweetIDs(ctx context.Context, tweetIDs []string) error {
-	if len(tweetIDs) == 0 {
-		return nil
-	}
-	query, args, err := sqlx.In(`DELETE FROM bookmarks WHERE tweet_id IN (?)`, tweetIDs)
-	if err != nil {
-		return err
-	}
-	query = r.getDB().Rebind(query)
-	_, err = r.getDB().ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("bulk delete bookmarks by tweet IDs failed: %w", err)
-	}
-	return nil
-}
-
 // ======================================================================
-// Advanced Queries
+= Advanced Queries
 // ======================================================================
 
-// GetMostBookmarkedTweets returns the most bookmarked tweets (trending).
+// GetMostBookmarkedTweets returns the most bookmarked tweets.
 func (r *bookmarkRepo) GetMostBookmarkedTweets(ctx context.Context, limit int, since time.Time) ([]*entities.Tweet, error) {
 	if limit < 1 {
 		limit = 10
@@ -541,8 +503,8 @@ func (r *bookmarkRepo) GetMostBookmarkedTweets(ctx context.Context, limit int, s
 	return tweets, nil
 }
 
-// GetBookmarkTimeline returns bookmarks in reverse chronological order for a user's feed.
-func (r *bookmarkRepo) GetBookmarkTimeline(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Bookmark, string, error) {
+// GetBookmarksTimeline returns bookmarks in reverse chronological order.
+func (r *bookmarkRepo) GetBookmarksTimeline(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Bookmark, string, error) {
 	if len(userIDs) == 0 {
 		return []*entities.Bookmark{}, "", nil
 	}
@@ -552,26 +514,31 @@ func (r *bookmarkRepo) GetBookmarkTimeline(ctx context.Context, userIDs []string
 	query := `
 		SELECT b.*
 		FROM bookmarks b
-		WHERE b.user_id = ANY($1)
+		WHERE b.user_id IN (?)
 	`
 	if cursor != "" {
 		query += ` AND b.id > $2`
 	}
 	query += ` ORDER BY b.created_at DESC, b.id DESC LIMIT $?`
 
-	args := []interface{}{pq.Array(userIDs)}
+	args := []interface{}{userIDs}
 	argIndex := 2
 	if cursor != "" {
 		args = append(args, cursor)
 		argIndex = 3
 	}
 	args = append(args, limit)
+
+	query, args, err := sqlx.In(query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("build IN query failed: %w", err)
+	}
 	query = r.getDB().Rebind(query)
 
 	var bookmarks []*entities.Bookmark
-	err := r.getDB().SelectContext(ctx, &bookmarks, query, args...)
+	err = r.getDB().SelectContext(ctx, &bookmarks, query, args...)
 	if err != nil {
-		return nil, "", fmt.Errorf("get bookmark timeline failed: %w", err)
+		return nil, "", fmt.Errorf("get bookmarks timeline failed: %w", err)
 	}
 
 	var nextCursor string
@@ -581,41 +548,46 @@ func (r *bookmarkRepo) GetBookmarkTimeline(ctx context.Context, userIDs []string
 	return bookmarks, nextCursor, nil
 }
 
-// GetUserBookmarkCounts returns bookmark counts for multiple users.
-func (r *bookmarkRepo) GetUserBookmarkCounts(ctx context.Context, userIDs []string) (map[string]int64, error) {
-	if len(userIDs) == 0 {
-		return map[string]int64{}, nil
+// GetBookmarksByDateRange returns bookmarks within a date range.
+func (r *bookmarkRepo) GetBookmarksByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Bookmark, string, error) {
+	if limit < 1 {
+		limit = 20
 	}
 	query := `
-		SELECT user_id, COUNT(*) as count
-		FROM bookmarks
-		WHERE user_id = ANY($1)
-		GROUP BY user_id
+		SELECT * FROM bookmarks
+		WHERE user_id = $1
+		  AND created_at >= $2
+		  AND created_at <= $3
 	`
-	var results []struct {
-		UserID string `db:"user_id"`
-		Count  int64  `db:"count"`
+	if cursor != "" {
+		query += ` AND id > $4`
 	}
-	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID, start, end}
+	argIndex := 4
+	if cursor != "" {
+		args = append(args, cursor)
+		argIndex = 5
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var bookmarks []*entities.Bookmark
+	err := r.getDB().SelectContext(ctx, &bookmarks, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("get user bookmark counts failed: %w", err)
+		return nil, "", fmt.Errorf("get bookmarks by date range failed: %w", err)
 	}
 
-	counts := make(map[string]int64, len(results))
-	for _, r := range results {
-		counts[r.UserID] = r.Count
+	var nextCursor string
+	if len(bookmarks) == limit {
+		nextCursor = bookmarks[len(bookmarks)-1].ID
 	}
-	return counts, nil
-}
-
-// GetTweetBookmarkCounts returns bookmark counts for multiple tweets (already in CountByTweetIDs).
-// This is an alias for CountByTweetIDs.
-func (r *bookmarkRepo) GetTweetBookmarkCounts(ctx context.Context, tweetIDs []string) (map[string]int64, error) {
-	return r.CountByTweetIDs(ctx, tweetIDs)
+	return bookmarks, nextCursor, nil
 }
 
 // ======================================================================
-// Stats and Analytics
+= Stats and Analytics
 // ======================================================================
 
 // GetBookmarkStats returns aggregated bookmark statistics.
@@ -673,99 +645,31 @@ type DailyBookmarkCount struct {
 	UniqueUsers int64     `db:"unique_users"`
 }
 
-// GetBookmarkStatsByUser returns bookmark stats for a specific user.
-func (r *bookmarkRepo) GetBookmarkStatsByUser(ctx context.Context, userID string) (*UserBookmarkStats, error) {
+// GetUserBookmarkStats returns bookmark statistics for a specific user.
+func (r *bookmarkRepo) GetUserBookmarkStats(ctx context.Context, userID string) (*UserBookmarkStats, error) {
 	query := `
 		SELECT 
-			COUNT(*) as total_bookmarks,
+			COUNT(*) as total,
+			COUNT(DISTINCT tweet_id) as unique_tweets,
 			MAX(created_at) as last_bookmark,
-			MIN(created_at) as first_bookmark,
-			COUNT(DISTINCT tweet_id) as unique_tweets
+			MIN(created_at) as first_bookmark
 		FROM bookmarks
 		WHERE user_id = $1
 	`
 	var stats UserBookmarkStats
 	err := r.getDB().GetContext(ctx, &stats, query, userID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return &UserBookmarkStats{
-				UserID: userID,
-				TotalBookmarks: 0,
-				UniqueTweets: 0,
-			}, nil
-		}
-		return nil, fmt.Errorf("get bookmark stats by user failed: %w", err)
+		return nil, fmt.Errorf("get user bookmark stats failed: %w", err)
 	}
-	stats.UserID = userID
 	return &stats, nil
 }
 
-// UserBookmarkStats represents bookmark stats for a user.
+// UserBookmarkStats represents bookmark statistics for a user.
 type UserBookmarkStats struct {
-	UserID         string    `db:"user_id"`
-	TotalBookmarks int64     `db:"total_bookmarks"`
-	UniqueTweets   int64     `db:"unique_tweets"`
-	LastBookmark   time.Time `db:"last_bookmark"`
-	FirstBookmark  time.Time `db:"first_bookmark"`
-}
-
-// ======================================================================
-= Export / Import
-// ======================================================================
-
-// ExportBookmarks exports all bookmarks for a user.
-func (r *bookmarkRepo) ExportBookmarks(ctx context.Context, userID string) ([]*entities.Bookmark, error) {
-	query := `
-		SELECT * FROM bookmarks
-		WHERE user_id = $1
-		ORDER BY created_at DESC
-	`
-	var bookmarks []*entities.Bookmark
-	err := r.getDB().SelectContext(ctx, &bookmarks, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("export bookmarks failed: %w", err)
-	}
-	return bookmarks, nil
-}
-
-// ImportBookmarks imports bookmarks for a user (skips duplicates).
-func (r *bookmarkRepo) ImportBookmarks(ctx context.Context, userID string, tweetIDs []string) (int64, error) {
-	if len(tweetIDs) == 0 {
-		return 0, nil
-	}
-	// Build insert query with ON CONFLICT DO NOTHING
-	query := `
-		INSERT INTO bookmarks (id, tweet_id, user_id, created_at)
-		SELECT 
-			gen_random_uuid(),
-			unnest($1::text[]),
-			$2,
-			NOW()
-		ON CONFLICT (tweet_id, user_id) DO NOTHING
-		RETURNING id
-	`
-	var insertedIDs []string
-	err := r.getDB().SelectContext(ctx, &insertedIDs, query, pq.Array(tweetIDs), userID)
-	if err != nil {
-		return 0, fmt.Errorf("import bookmarks failed: %w", err)
-	}
-	return int64(len(insertedIDs)), nil
-}
-
-// ======================================================================
-= Cleanup Operations
-// ======================================================================
-
-// DeleteOldBookmarks removes bookmarks older than the specified duration.
-func (r *bookmarkRepo) DeleteOldBookmarks(ctx context.Context, olderThan time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-olderThan)
-	query := `DELETE FROM bookmarks WHERE created_at < $1 RETURNING id`
-	var deletedIDs []string
-	err := r.getDB().SelectContext(ctx, &deletedIDs, query, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("delete old bookmarks failed: %w", err)
-	}
-	return int64(len(deletedIDs)), nil
+	Total        int64     `db:"total"`
+	UniqueTweets int64     `db:"unique_tweets"`
+	LastBookmark time.Time `db:"last_bookmark"`
+	FirstBookmark time.Time `db:"first_bookmark"`
 }
 
 // ======================================================================
