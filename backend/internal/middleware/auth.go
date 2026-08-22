@@ -3,6 +3,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,9 +12,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 
-	"twitter-clone/backend/internal/adapter"
 	"twitter-clone/backend/internal/domain/entities"
 	"twitter-clone/backend/internal/repository/interfaces"
 	"twitter-clone/backend/pkg/logger"
@@ -23,49 +24,66 @@ import (
 type contextKey string
 
 const (
-	UserIDKey    contextKey = "user_id"
-	UserKey      contextKey = "user"
-	UserRoleKey  contextKey = "user_role"
-	UserClaimsKey contextKey = "user_claims"
+	UserIDKey          contextKey = "user_id"
+	UserKey            contextKey = "user"
+	UserRoleKey        contextKey = "user_role"
+	UserClaimsKey      contextKey = "user_claims"
 	IsAuthenticatedKey contextKey = "is_authenticated"
+	TokenKey           contextKey = "token"
 )
 
 // AuthConfig holds configuration for the auth middleware.
 type AuthConfig struct {
 	JWTSecret        string
-	RedisAdapter     adapter.RedisAdapter
+	RedisClient      *redis.Client
 	UserRepo         interfaces.UserRepository
-	// Optional: cache user TTL
 	UserCacheTTL     time.Duration
-	// Optional: token blacklist enabled
 	EnableBlacklist  bool
-	// Optional: allow unauthenticated requests
 	AllowOptional    bool
+	TokenLookup      []string // "header", "cookie", "query"
+	HeaderName       string
+	CookieName       string
+	QueryParamName   string
 }
 
 // AuthMiddleware is the main middleware struct.
 type AuthMiddleware struct {
-	config     AuthConfig
-	log        *logrus.Entry
+	config AuthConfig
+	log    *logrus.Entry
 }
 
-// NewAuthMiddleware creates a new auth middleware.
+// NewAuthMiddleware creates a new auth middleware instance.
 func NewAuthMiddleware(cfg AuthConfig) *AuthMiddleware {
+	if cfg.HeaderName == "" {
+		cfg.HeaderName = "Authorization"
+	}
+	if cfg.CookieName == "" {
+		cfg.CookieName = "access_token"
+	}
+	if cfg.QueryParamName == "" {
+		cfg.QueryParamName = "token"
+	}
+	if len(cfg.TokenLookup) == 0 {
+		cfg.TokenLookup = []string{"header", "cookie", "query"}
+	}
+	if cfg.UserCacheTTL == 0 {
+		cfg.UserCacheTTL = 5 * time.Minute
+	}
 	return &AuthMiddleware{
 		config: cfg,
 		log:    logger.WithField("middleware", "auth"),
 	}
 }
 
-// Middleware returns a middleware function that authenticates requests.
+// Middleware returns the HTTP handler that authenticates requests.
 func (a *AuthMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		// Try to extract token
+
+		// Extract token from request
 		tokenString := a.extractToken(r)
 		if tokenString == "" {
 			if a.config.AllowOptional {
-				// Set unauthenticated context and proceed
 				ctx = context.WithValue(ctx, IsAuthenticatedKey, false)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -73,7 +91,8 @@ func (a *AuthMiddleware) Middleware(next http.Handler) http.Handler {
 			a.sendError(w, http.StatusUnauthorized, "Missing authentication token")
 			return
 		}
-		// Validate token and get claims
+
+		// Validate token and extract claims
 		claims, err := a.validateToken(tokenString)
 		if err != nil {
 			a.log.WithError(err).Debug("Token validation failed")
@@ -82,91 +101,125 @@ func (a *AuthMiddleware) Middleware(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
-			a.sendError(w, http.StatusUnauthorized, "Invalid or expired token")
+			if errors.Is(err, jwt.ErrTokenExpired) {
+				a.sendError(w, http.StatusUnauthorized, "Token has expired")
+				return
+			}
+			a.sendError(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
-		// Check blacklist if enabled
-		if a.config.EnableBlacklist && a.config.RedisAdapter != nil {
+
+		// Check token blacklist
+		if a.config.EnableBlacklist && a.config.RedisClient != nil {
 			if a.isTokenBlacklisted(ctx, tokenString) {
-				a.sendError(w, http.StatusUnauthorized, "Token revoked")
+				a.sendError(w, http.StatusUnauthorized, "Token has been revoked")
 				return
 			}
 		}
-		// Get user ID from claims
-		userID, ok := claims["sub"].(string)
-		if !ok || userID == "" {
+
+		// Extract user ID from claims
+		userID, err := a.getUserIDFromClaims(claims)
+		if err != nil {
 			a.sendError(w, http.StatusUnauthorized, "Invalid token claims")
 			return
 		}
-		// Get role from claims
-		role, _ := claims["role"].(string)
-		// Load user from DB (or cache)
+
+		// Load user from database or cache
 		user, err := a.loadUser(ctx, userID)
 		if err != nil {
-			a.log.WithError(err).WithField("user_id", userID).Warn("Failed to load user")
-			if a.config.AllowOptional {
-				// Allow but mark as unauthenticated? Or deny? We'll deny to be safe.
+			if errors.Is(err, interfaces.ErrUserNotFound) {
 				a.sendError(w, http.StatusUnauthorized, "User not found")
 				return
 			}
-			a.sendError(w, http.StatusUnauthorized, "User not found")
+			a.log.WithError(err).WithField("user_id", userID).Error("Failed to load user")
+			a.sendError(w, http.StatusInternalServerError, "Internal server error")
 			return
 		}
+
 		// Check user status
 		if user.IsSuspended {
-			a.sendError(w, http.StatusForbidden, "Account suspended")
+			a.sendError(w, http.StatusForbidden, "Account has been suspended")
 			return
 		}
 		if !user.IsActive {
-			a.sendError(w, http.StatusForbidden, "Account inactive")
+			a.sendError(w, http.StatusForbidden, "Account is inactive")
 			return
 		}
-		// Store user and claims in context
+
+		// Extract role from claims
+		role := a.getRoleFromClaims(claims)
+
+		// Populate context with user information
 		ctx = context.WithValue(ctx, UserIDKey, user.ID)
 		ctx = context.WithValue(ctx, UserKey, user)
 		ctx = context.WithValue(ctx, UserRoleKey, entities.UserRole(role))
 		ctx = context.WithValue(ctx, UserClaimsKey, claims)
 		ctx = context.WithValue(ctx, IsAuthenticatedKey, true)
-		// Update last active (optional, could be done async)
-		// go a.userRepo.UpdateLastActive(context.Background(), user.ID)
-		// Proceed
+		ctx = context.WithValue(ctx, TokenKey, tokenString)
+
+		// Update last active asynchronously
+		go a.updateLastActive(user.ID)
+
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// OptionalMiddleware returns a middleware that authenticates if token present,
-// but allows unauthenticated requests.
+// OptionalMiddleware returns a middleware that authenticates if token present.
 func (a *AuthMiddleware) OptionalMiddleware(next http.Handler) http.Handler {
-	// Set AllowOptional true for this instance.
 	clone := *a
 	clone.config.AllowOptional = true
 	return clone.Middleware(next)
 }
 
-// extractToken extracts JWT token from Authorization header or cookie.
+// extractToken extracts JWT token from request using configured methods.
 func (a *AuthMiddleware) extractToken(r *http.Request) string {
-	// Check Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" {
-		// Bearer token
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-			return parts[1]
+	for _, lookup := range a.config.TokenLookup {
+		switch lookup {
+		case "header":
+			if token := a.extractFromHeader(r); token != "" {
+				return token
+			}
+		case "cookie":
+			if token := a.extractFromCookie(r); token != "" {
+				return token
+			}
+		case "query":
+			if token := a.extractFromQuery(r); token != "" {
+				return token
+			}
 		}
-		// Maybe token is directly in header (no Bearer)
-		if len(parts) == 1 {
-			return parts[0]
-		}
-	}
-	// Check cookie
-	if cookie, err := r.Cookie("access_token"); err == nil && cookie.Value != "" {
-		return cookie.Value
-	}
-	// Check query parameter (for WebSocket or debugging)
-	if token := r.URL.Query().Get("token"); token != "" {
-		return token
 	}
 	return ""
+}
+
+// extractFromHeader extracts token from Authorization header.
+func (a *AuthMiddleware) extractFromHeader(r *http.Request) string {
+	authHeader := r.Header.Get(a.config.HeaderName)
+	if authHeader == "" {
+		return ""
+	}
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return ""
+}
+
+// extractFromCookie extracts token from cookie.
+func (a *AuthMiddleware) extractFromCookie(r *http.Request) string {
+	cookie, err := r.Cookie(a.config.CookieName)
+	if err != nil || cookie.Value == "" {
+		return ""
+	}
+	return cookie.Value
+}
+
+// extractFromQuery extracts token from query parameter.
+func (a *AuthMiddleware) extractFromQuery(r *http.Request) string {
+	return r.URL.Query().Get(a.config.QueryParamName)
 }
 
 // validateToken parses and validates the JWT token.
@@ -187,59 +240,101 @@ func (a *AuthMiddleware) validateToken(tokenString string) (jwt.MapClaims, error
 	if !ok {
 		return nil, errors.New("invalid token claims")
 	}
-	// Check expiry
+	// Verify expiration
 	if exp, ok := claims["exp"].(float64); ok {
 		if time.Now().Unix() > int64(exp) {
-			return nil, errors.New("token expired")
+			return nil, jwt.ErrTokenExpired
 		}
 	} else {
-		return nil, errors.New("token missing expiry")
+		return nil, errors.New("token missing expiration claim")
 	}
 	return claims, nil
 }
 
-// isTokenBlacklisted checks if the token is in Redis blacklist.
+// isTokenBlacklisted checks if token is in Redis blacklist.
 func (a *AuthMiddleware) isTokenBlacklisted(ctx context.Context, token string) bool {
-	if a.config.RedisAdapter == nil {
+	if a.config.RedisClient == nil {
 		return false
 	}
 	key := "blacklist:" + token
-	exists, err := a.config.RedisAdapter.Exists(ctx, key)
+	val, err := a.config.RedisClient.Get(ctx, key).Result()
 	if err != nil {
-		a.log.WithError(err).Warn("Failed to check token blacklist")
+		if !errors.Is(err, redis.Nil) {
+			a.log.WithError(err).Warn("Failed to check token blacklist")
+		}
 		return false
 	}
-	return exists > 0
+	return val != ""
 }
 
-// loadUser loads user from DB or cache.
+// getUserIDFromClaims extracts user ID from JWT claims.
+func (a *AuthMiddleware) getUserIDFromClaims(claims jwt.MapClaims) (string, error) {
+	sub, ok := claims["sub"].(string)
+	if !ok || sub == "" {
+		return "", errors.New("missing subject claim")
+	}
+	return sub, nil
+}
+
+// getRoleFromClaims extracts role from JWT claims.
+func (a *AuthMiddleware) getRoleFromClaims(claims jwt.MapClaims) string {
+	role, ok := claims["role"].(string)
+	if !ok {
+		return string(entities.RoleUser)
+	}
+	return role
+}
+
+// loadUser loads user from database or Redis cache.
 func (a *AuthMiddleware) loadUser(ctx context.Context, userID string) (*entities.User, error) {
-	// Try cache first if Redis available and TTL set
-	if a.config.RedisAdapter != nil && a.config.UserCacheTTL > 0 {
+	// Try cache first
+	if a.config.RedisClient != nil && a.config.UserCacheTTL > 0 {
 		cacheKey := "user:" + userID
-		var user entities.User
-		if err := a.config.RedisAdapter.GetJSON(ctx, cacheKey, &user); err == nil {
-			return &user, nil
+		cached, err := a.config.RedisClient.Get(ctx, cacheKey).Result()
+		if err == nil && cached != "" {
+			var user entities.User
+			if err := json.Unmarshal([]byte(cached), &user); err == nil {
+				return &user, nil
+			}
 		}
 	}
-	// Load from DB
+	// Load from database
 	user, err := a.config.UserRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	// Store in cache if Redis available
-	if a.config.RedisAdapter != nil && a.config.UserCacheTTL > 0 {
+	// Store in cache
+	if a.config.RedisClient != nil && a.config.UserCacheTTL > 0 {
 		cacheKey := "user:" + userID
-		_ = a.config.RedisAdapter.CacheSet(ctx, cacheKey, user, a.config.UserCacheTTL)
+		data, err := json.Marshal(user)
+		if err == nil {
+			a.config.RedisClient.Set(ctx, cacheKey, data, a.config.UserCacheTTL)
+		}
 	}
 	return user, nil
 }
 
-// sendError sends an HTTP error response.
+// updateLastActive updates user's last active timestamp asynchronously.
+func (a *AuthMiddleware) updateLastActive(userID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.config.UserRepo.UpdateLastActive(ctx, userID); err != nil {
+		a.log.WithError(err).WithField("user_id", userID).Warn("Failed to update last active")
+	}
+}
+
+// sendError sends a JSON error response.
 func (a *AuthMiddleware) sendError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(`{"error":"` + message + `"}`))
+	response := map[string]interface{}{
+		"error":   message,
+		"status":  status,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		a.log.WithError(err).Error("Failed to encode error response")
+	}
 }
 
 // ---- Helper functions for retrieving user info from context ----
@@ -296,7 +391,20 @@ func GetClaims(ctx context.Context) (jwt.MapClaims, error) {
 	return claims, nil
 }
 
-// IsAuthenticated checks if request is authenticated.
+// GetToken extracts the raw JWT token from context.
+func GetToken(ctx context.Context) (string, error) {
+	val := ctx.Value(TokenKey)
+	if val == nil {
+		return "", errors.New("token not found in context")
+	}
+	token, ok := val.(string)
+	if !ok {
+		return "", errors.New("invalid token type")
+	}
+	return token, nil
+}
+
+// IsAuthenticated checks if the request is authenticated.
 func IsAuthenticated(ctx context.Context) bool {
 	val := ctx.Value(IsAuthenticatedKey)
 	if val == nil {
@@ -315,14 +423,14 @@ func IsAuthenticated(ctx context.Context) bool {
 func RequireRole(allowedRoles ...entities.UserRole) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			userRole, err := GetUserRole(r.Context())
+			role, err := GetUserRole(r.Context())
 			if err != nil {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 			allowed := false
-			for _, role := range allowedRoles {
-				if userRole == role {
+			for _, allowedRole := range allowedRoles {
+				if role == allowedRole {
 					allowed = true
 					break
 				}
@@ -336,22 +444,22 @@ func RequireRole(allowedRoles ...entities.UserRole) mux.MiddlewareFunc {
 	}
 }
 
-// RequireAdmin is a shortcut for RequireRole(RoleAdmin).
+// RequireAdmin returns a middleware that requires admin role.
 func RequireAdmin(next http.Handler) http.Handler {
 	return RequireRole(entities.RoleAdmin)(next)
 }
 
-// RequireAdminOrModerator is a shortcut.
+// RequireAdminOrModerator returns a middleware that requires admin or moderator.
 func RequireAdminOrModerator(next http.Handler) http.Handler {
 	return RequireRole(entities.RoleAdmin, entities.RoleModerator)(next)
 }
 
-// ---- Blacklist management ----
+// ---- Token management ----
 
-// BlacklistToken adds a token to the blacklist with its remaining TTL.
+// BlacklistToken adds a token to the blacklist in Redis.
 func (a *AuthMiddleware) BlacklistToken(ctx context.Context, token string) error {
-	if a.config.RedisAdapter == nil {
-		return errors.New("redis not configured")
+	if a.config.RedisClient == nil {
+		return errors.New("Redis client not configured")
 	}
 	// Parse token to get expiry
 	claims, err := a.validateToken(token)
@@ -360,20 +468,45 @@ func (a *AuthMiddleware) BlacklistToken(ctx context.Context, token string) error
 	}
 	exp, ok := claims["exp"].(float64)
 	if !ok {
-		return errors.New("token missing expiry")
+		return errors.New("token missing expiration")
 	}
 	ttl := time.Until(time.Unix(int64(exp), 0))
 	if ttl <= 0 {
-		// Already expired, no need to blacklist
-		return nil
+		return nil // Already expired
 	}
 	key := "blacklist:" + token
-	return a.config.RedisAdapter.Set(ctx, key, "1", ttl)
+	return a.config.RedisClient.Set(ctx, key, "1", ttl).Err()
 }
 
-// ---- Helper to generate auth context for tests ----
+// RevokeAllUserTokens revokes all tokens for a user.
+func (a *AuthMiddleware) RevokeAllUserTokens(ctx context.Context, userID string) error {
+	if a.config.RedisClient == nil {
+		return errors.New("Redis client not configured")
+	}
+	key := "user_tokens:" + userID
+	// Store revocation timestamp
+	return a.config.RedisClient.Set(ctx, key, time.Now().Unix(), 7*24*time.Hour).Err()
+}
 
-// WithUserContext creates a context with user info for testing.
+// IsUserTokenRevoked checks if all tokens for a user are revoked.
+func (a *AuthMiddleware) IsUserTokenRevoked(ctx context.Context, userID string) (bool, error) {
+	if a.config.RedisClient == nil {
+		return false, nil
+	}
+	key := "user_tokens:" + userID
+	_, err := a.config.RedisClient.Get(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// ---- Test helpers ----
+
+// WithUserContext creates a context with user information for testing.
 func WithUserContext(ctx context.Context, user *entities.User) context.Context {
 	ctx = context.WithValue(ctx, UserIDKey, user.ID)
 	ctx = context.WithValue(ctx, UserKey, user)
@@ -387,35 +520,10 @@ func WithAdminContext(ctx context.Context, admin *entities.User) context.Context
 	return WithUserContext(ctx, admin)
 }
 
-// ---- OpenAPI/ Swagger annotations (optional) ----
-// These are just for documentation; not needed for code.
+// ---- Route protection helper ----
 
-// ---- Security ----
-
-// SecureHeaders middleware adds security headers (could be separate).
-// But we can include a helper.
-
-// ---- Logging ----
-
-func (a *AuthMiddleware) logWithClaims(claims jwt.MapClaims) *logrus.Entry {
-	entry := a.log.WithFields(logrus.Fields{
-		"sub": claims["sub"],
-		"exp": claims["exp"],
-	})
-	if role, ok := claims["role"]; ok {
-		entry = entry.WithField("role", role)
-	}
-	return entry
-}
-
-// ---- Optional: token refresh logic ----
-// This could be implemented here but usually handled in service.
-
-// ---- Route protection helpers ----
-
-// ProtectRoute wraps a handler with auth middleware and optional role.
+// ProtectRoute wraps a handler with auth middleware and optional role check.
 func (a *AuthMiddleware) ProtectRoute(handler http.Handler, roles ...entities.UserRole) http.Handler {
-	// First apply auth
 	handler = a.Middleware(handler)
 	if len(roles) > 0 {
 		handler = RequireRole(roles...)(handler)
@@ -423,15 +531,24 @@ func (a *AuthMiddleware) ProtectRoute(handler http.Handler, roles ...entities.Us
 	return handler
 }
 
-// ---- Health check for middleware ----
+// ---- Health check ----
+
+// HealthCheck returns the health status of the auth middleware.
 func (a *AuthMiddleware) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	// Check if Redis is available if configured
-	if a.config.RedisAdapter != nil {
-		if err := a.config.RedisAdapter.Ping(r.Context()); err != nil {
-			http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
-			return
+	status := map[string]interface{}{
+		"status": "ok",
+		"component": "auth_middleware",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	if a.config.RedisClient != nil {
+		if err := a.config.RedisClient.Ping(r.Context()).Err(); err != nil {
+			status["status"] = "degraded"
+			status["redis"] = "unavailable"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			status["redis"] = "available"
 		}
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok","component":"auth_middleware"}`))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
