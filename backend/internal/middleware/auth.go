@@ -3,26 +3,29 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
-	"github.com/redis/go-redis/v9"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 
+	"twitter-clone/backend/internal/adapter"
 	"twitter-clone/backend/internal/domain/entities"
 	"twitter-clone/backend/internal/repository/interfaces"
 	"twitter-clone/backend/pkg/logger"
 )
 
-// Context keys for storing user information.
+// ======================================================================
+// Context Keys
+// ======================================================================
+
 type contextKey string
 
 const (
@@ -31,147 +34,85 @@ const (
 	UserRoleKey        contextKey = "user_role"
 	UserClaimsKey      contextKey = "user_claims"
 	IsAuthenticatedKey contextKey = "is_authenticated"
+	UserPermissionsKey contextKey = "user_permissions"
 	TokenKey           contextKey = "token"
-	AuthTypeKey        contextKey = "auth_type"
-	APITokenKey        contextKey = "api_token"
-	SessionIDKey       contextKey = "session_id"
 )
 
-// Authentication types.
-const (
-	AuthTypeJWT     = "jwt"
-	AuthTypeRefresh = "refresh"
-	AuthTypeAPIKey  = "api_key"
-	AuthTypeNone    = "none"
-)
+// ======================================================================
+// Configuration
+// ======================================================================
 
-// Permission constants.
-const (
-	PermReadTweets      = "tweets:read"
-	PermCreateTweets    = "tweets:create"
-	PermUpdateTweets    = "tweets:update"
-	PermDeleteTweets    = "tweets:delete"
-	PermReadUsers       = "users:read"
-	PermUpdateUsers     = "users:update"
-	PermDeleteUsers     = "users:delete"
-	PermModerateContent = "content:moderate"
-	PermManageRoles     = "roles:manage"
-	PermAdminAccess     = "admin:access"
-	PermViewAuditLogs   = "audit:view"
-	PermManageSystem    = "system:manage"
-)
-
-// RolePermissions maps roles to their permissions.
-var RolePermissions = map[entities.UserRole][]string{
-	entities.RoleUser: {
-		PermReadTweets,
-		PermCreateTweets,
-		PermUpdateTweets,
-		PermDeleteTweets,
-		PermReadUsers,
-		PermUpdateUsers,
-	},
-	entities.RoleModerator: {
-		PermReadTweets,
-		PermCreateTweets,
-		PermUpdateTweets,
-		PermDeleteTweets,
-		PermReadUsers,
-		PermUpdateUsers,
-		PermModerateContent,
-		PermViewAuditLogs,
-	},
-	entities.RoleAdmin: {
-		PermReadTweets,
-		PermCreateTweets,
-		PermUpdateTweets,
-		PermDeleteTweets,
-		PermReadUsers,
-		PermUpdateUsers,
-		PermDeleteUsers,
-		PermModerateContent,
-		PermManageRoles,
-		PermAdminAccess,
-		PermViewAuditLogs,
-		PermManageSystem,
-	},
-}
-
-// AuthConfig holds configuration for the auth middleware.
+// AuthConfig holds all configuration for the auth middleware.
 type AuthConfig struct {
-	JWTSecret           string
-	RefreshSecret       string
-	RedisClient         *redis.Client
-	UserRepo            interfaces.UserRepository
-	SessionRepo         interfaces.SessionRepository
-	UserCacheTTL        time.Duration
-	EnableBlacklist     bool
-	AllowOptional       bool
-	TokenLookup         []string
-	HeaderName          string
-	CookieName          string
-	RefreshCookieName   string
-	QueryParamName      string
-	APICookieName       string
-	APIHeaderName       string
-	JWTExpiry           time.Duration
-	RefreshExpiry       time.Duration
-	EnableAuditLog      bool
-	EnableMFA           bool
-	RequireMFA          bool
+	// JWT configuration
+	JWTSecret        string        `json:"jwt_secret"`
+	JWTIssuer        string        `json:"jwt_issuer"`
+	JWTAudience      string        `json:"jwt_audience"`
+	JWTExpiry        time.Duration `json:"jwt_expiry"`
+	
+	// Redis for caching and blacklist
+	RedisAdapter     adapter.RedisAdapter `json:"-"`
+	UserCacheTTL     time.Duration `json:"user_cache_ttl"`
+	
+	// User repository for loading user data
+	UserRepo         interfaces.UserRepository `json:"-"`
+	
+	// Blacklist settings
+	EnableBlacklist  bool          `json:"enable_blacklist"`
+	BlacklistPrefix  string        `json:"blacklist_prefix"`
+	
+	// Cache settings
+	EnableUserCache  bool          `json:"enable_user_cache"`
+	UserCachePrefix  string        `json:"user_cache_prefix"`
+	
+	// Authentication mode
+	AllowOptional    bool          `json:"allow_optional"`
+	
+	// WebSocket support
+	AllowWebSocket   bool          `json:"allow_websocket"`
+	
+	// Logging
+	LogLevel         string        `json:"log_level"`
+	
+	// Security
+	RequireUserActive bool         `json:"require_user_active"`
+	RequireUserVerified bool       `json:"require_user_verified"`
 }
+
+// DefaultAuthConfig returns sensible defaults.
+func DefaultAuthConfig() AuthConfig {
+	return AuthConfig{
+		JWTSecret:         "change-me-in-production",
+		JWTIssuer:         "twitter-clone",
+		JWTAudience:       "twitter-clone-users",
+		JWTExpiry:         15 * time.Minute,
+		UserCacheTTL:      5 * time.Minute,
+		EnableBlacklist:   true,
+		BlacklistPrefix:   "blacklist:",
+		EnableUserCache:   true,
+		UserCachePrefix:   "user:",
+		AllowOptional:     false,
+		AllowWebSocket:    true,
+		RequireUserActive: true,
+		RequireUserVerified: false,
+	}
+}
+
+// ======================================================================
+// Auth Middleware
+// ======================================================================
 
 // AuthMiddleware is the main middleware struct.
 type AuthMiddleware struct {
 	config AuthConfig
 	log    *logrus.Entry
+	mu     sync.RWMutex
 }
 
-// AuditLogEntry represents an authentication audit log.
-type AuditLogEntry struct {
-	UserID    string                 `json:"user_id"`
-	Username  string                 `json:"username,omitempty"`
-	Action    string                 `json:"action"`
-	AuthType  string                 `json:"auth_type"`
-	IP        string                 `json:"ip"`
-	UserAgent string                 `json:"user_agent"`
-	Success   bool                   `json:"success"`
-	Error     string                 `json:"error,omitempty"`
-	Timestamp time.Time              `json:"timestamp"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
-}
-
-// NewAuthMiddleware creates a new auth middleware instance.
+// NewAuthMiddleware creates a new auth middleware.
 func NewAuthMiddleware(cfg AuthConfig) *AuthMiddleware {
-	if cfg.HeaderName == "" {
-		cfg.HeaderName = "Authorization"
-	}
-	if cfg.CookieName == "" {
-		cfg.CookieName = "access_token"
-	}
-	if cfg.RefreshCookieName == "" {
-		cfg.RefreshCookieName = "refresh_token"
-	}
-	if cfg.QueryParamName == "" {
-		cfg.QueryParamName = "token"
-	}
-	if cfg.APIHeaderName == "" {
-		cfg.APIHeaderName = "X-API-Key"
-	}
-	if cfg.APICookieName == "" {
-		cfg.APICookieName = "api_key"
-	}
-	if len(cfg.TokenLookup) == 0 {
-		cfg.TokenLookup = []string{"header", "cookie", "query"}
-	}
-	if cfg.UserCacheTTL == 0 {
-		cfg.UserCacheTTL = 5 * time.Minute
-	}
-	if cfg.JWTExpiry == 0 {
-		cfg.JWTExpiry = 15 * time.Minute
-	}
-	if cfg.RefreshExpiry == 0 {
-		cfg.RefreshExpiry = 7 * 24 * time.Hour
+	if cfg.JWTSecret == "change-me-in-production" {
+		logger.Warn("JWT_SECRET is set to default value – please change for production")
 	}
 	return &AuthMiddleware{
 		config: cfg,
@@ -179,488 +120,140 @@ func NewAuthMiddleware(cfg AuthConfig) *AuthMiddleware {
 	}
 }
 
-// Middleware returns the HTTP handler that authenticates requests.
+// Middleware returns the HTTP middleware handler.
 func (a *AuthMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-
-		// Try to authenticate
-		authResult := a.authenticate(r)
-
-		if !authResult.Authenticated {
+		
+		// Extract token
+		tokenString := a.extractToken(r)
+		if tokenString == "" {
 			if a.config.AllowOptional {
-				ctx = context.WithValue(ctx, IsAuthenticatedKey, false)
+				ctx = a.setUnauthenticatedContext(ctx)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
-			a.sendError(w, http.StatusUnauthorized, authResult.ErrorMessage)
+			a.sendError(w, http.StatusUnauthorized, "Missing authentication token", "token_missing")
 			return
 		}
-
-		// If MFA is required and user hasn't verified MFA
-		if a.config.RequireMFA && !authResult.MFAVerified {
-			a.sendError(w, http.StatusForbidden, "MFA verification required")
+		
+		// Validate and parse token
+		claims, err := a.validateToken(tokenString)
+		if err != nil {
+			a.log.WithError(err).Debug("Token validation failed")
+			if a.config.AllowOptional {
+				ctx = a.setUnauthenticatedContext(ctx)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			a.sendError(w, http.StatusUnauthorized, "Invalid or expired token", err.Error())
 			return
 		}
-
-		// Populate context with user information
-		ctx = context.WithValue(ctx, UserIDKey, authResult.User.ID)
-		ctx = context.WithValue(ctx, UserKey, authResult.User)
-		ctx = context.WithValue(ctx, UserRoleKey, authResult.User.Role)
-		ctx = context.WithValue(ctx, UserClaimsKey, authResult.Claims)
-		ctx = context.WithValue(ctx, IsAuthenticatedKey, true)
-		ctx = context.WithValue(ctx, TokenKey, authResult.Token)
-		ctx = context.WithValue(ctx, AuthTypeKey, authResult.AuthType)
-		if authResult.SessionID != "" {
-			ctx = context.WithValue(ctx, SessionIDKey, authResult.SessionID)
+		
+		// Check blacklist
+		if a.config.EnableBlacklist && a.config.RedisAdapter != nil {
+			if a.isTokenBlacklisted(ctx, tokenString) {
+				a.sendError(w, http.StatusUnauthorized, "Token has been revoked", "token_revoked")
+				return
+			}
 		}
-		if authResult.APIToken != "" {
-			ctx = context.WithValue(ctx, APITokenKey, authResult.APIToken)
+		
+		// Extract user ID from claims
+		userID, err := a.extractUserID(claims)
+		if err != nil {
+			a.sendError(w, http.StatusUnauthorized, "Invalid token claims", err.Error())
+			return
 		}
-
-		// Update last active asynchronously
-		go a.updateLastActive(authResult.User.ID)
-
+		
+		// Load user
+		user, err := a.loadUser(ctx, userID)
+		if err != nil {
+			a.log.WithError(err).WithField("user_id", userID).Warn("Failed to load user")
+			if a.config.AllowOptional {
+				ctx = a.setUnauthenticatedContext(ctx)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			if errors.Is(err, interfaces.ErrUserNotFound) {
+				a.sendError(w, http.StatusUnauthorized, "User not found", "user_not_found")
+			} else {
+				a.sendError(w, http.StatusInternalServerError, "Failed to load user", "user_load_error")
+			}
+			return
+		}
+		
+		// Check user status
+		if err := a.validateUserStatus(user); err != nil {
+			a.sendError(w, http.StatusForbidden, err.Error(), "user_status_invalid")
+			return
+		}
+		
+		// Extract role from claims or user
+		role := a.extractRole(claims, user)
+		
+		// Build permissions
+		permissions := a.buildPermissions(user, role)
+		
+		// Set context
+		ctx = a.setAuthenticatedContext(ctx, user, role, claims, permissions, tokenString)
+		
+		// Update last active (async, don't block)
+		go a.updateLastActive(user.ID)
+		
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// AuthenticateResult holds the result of authentication.
-type AuthenticateResult struct {
-	Authenticated bool
-	User          *entities.User
-	Claims        jwt.MapClaims
-	Token         string
-	APIToken      string
-	SessionID     string
-	AuthType      string
-	MFAVerified   bool
-	ErrorMessage  string
-}
+// ======================================================================
+// Token Extraction
+// ======================================================================
 
-// authenticate attempts to authenticate the request using multiple methods.
-func (a *AuthMiddleware) authenticate(r *http.Request) AuthenticateResult {
-	// Try API key authentication first (machine-to-machine)
-	if apiKey := a.extractAPIKey(r); apiKey != "" {
-		return a.authenticateAPIKey(r.Context(), apiKey, r)
-	}
-
-	// Try JWT token authentication
-	tokenString := a.extractToken(r)
-	if tokenString == "" {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "No authentication token provided",
-		}
-	}
-
-	// Try JWT first
-	result := a.authenticateJWT(r.Context(), tokenString, r)
-	if result.Authenticated {
-		return result
-	}
-
-	// If JWT failed, try refresh token
-	if refreshToken := a.extractRefreshToken(r); refreshToken != "" {
-		return a.authenticateRefreshToken(r.Context(), refreshToken, r)
-	}
-
-	return AuthenticateResult{
-		Authenticated: false,
-		ErrorMessage:  "Authentication failed",
-	}
-}
-
-// authenticateJWT validates a JWT token.
-func (a *AuthMiddleware) authenticateJWT(ctx context.Context, tokenString string, r *http.Request) AuthenticateResult {
-	// Validate token
-	claims, err := a.validateToken(tokenString)
-	if err != nil {
-		a.logAudit(ctx, &AuditLogEntry{
-			Action:    "jwt_auth",
-			AuthType:  AuthTypeJWT,
-			IP:        getClientIP(r),
-			UserAgent: r.UserAgent(),
-			Success:   false,
-			Error:     err.Error(),
-			Timestamp: time.Now(),
-		})
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Invalid token",
-		}
-	}
-
-	// Check token blacklist
-	if a.config.EnableBlacklist && a.config.RedisClient != nil {
-		if a.isTokenBlacklisted(ctx, tokenString) {
-			a.logAudit(ctx, &AuditLogEntry{
-				Action:    "jwt_auth",
-				AuthType:  AuthTypeJWT,
-				IP:        getClientIP(r),
-				UserAgent: r.UserAgent(),
-				Success:   false,
-				Error:     "token blacklisted",
-				Timestamp: time.Now(),
-			})
-			return AuthenticateResult{
-				Authenticated: false,
-				ErrorMessage:  "Token has been revoked",
-			}
-		}
-	}
-
-	// Extract user ID
-	userID, err := a.getUserIDFromClaims(claims)
-	if err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Invalid token claims",
-		}
-	}
-
-	// Load user
-	user, err := a.loadUser(ctx, userID)
-	if err != nil {
-		if errors.Is(err, interfaces.ErrUserNotFound) {
-			return AuthenticateResult{
-				Authenticated: false,
-				ErrorMessage:  "User not found",
-			}
-		}
-		a.log.WithError(err).Error("Failed to load user")
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Internal server error",
-		}
-	}
-
-	// Check user status
-	if status := a.checkUserStatus(user); !status.Allowed {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  status.Message,
-		}
-	}
-
-	// Check session if SessionRepo available
-	if a.config.SessionRepo != nil {
-		if ok, err := a.validateSession(ctx, userID, claims); err != nil || !ok {
-			return AuthenticateResult{
-				Authenticated: false,
-				ErrorMessage:  "Session invalid or expired",
-			}
-		}
-	}
-
-	// Check MFA requirement (if enabled and user has MFA enabled)
-	mfaVerified := true
-	if a.config.EnableMFA {
-		mfaVerified = a.checkMFA(ctx, userID, claims)
-	}
-
-	a.logAudit(ctx, &AuditLogEntry{
-		UserID:   user.ID,
-		Username: user.Username,
-		Action:   "jwt_auth",
-		AuthType: AuthTypeJWT,
-		IP:       getClientIP(r),
-		UserAgent: r.UserAgent(),
-		Success:  true,
-		Timestamp: time.Now(),
-	})
-
-	return AuthenticateResult{
-		Authenticated: true,
-		User:          user,
-		Claims:        claims,
-		Token:         tokenString,
-		AuthType:      AuthTypeJWT,
-		MFAVerified:   mfaVerified,
-	}
-}
-
-// authenticateRefreshToken validates a refresh token.
-func (a *AuthMiddleware) authenticateRefreshToken(ctx context.Context, refreshToken string, r *http.Request) AuthenticateResult {
-	if a.config.SessionRepo == nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Refresh token not supported",
-		}
-	}
-
-	// Get session from database
-	session, err := a.config.SessionRepo.GetByRefreshToken(ctx, refreshToken)
-	if err != nil {
-		if errors.Is(err, interfaces.ErrSessionNotFound) {
-			return AuthenticateResult{
-				Authenticated: false,
-				ErrorMessage:  "Invalid refresh token",
-			}
-		}
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Internal server error",
-		}
-	}
-
-	// Check session expiry
-	if session.ExpiresAt.Before(time.Now()) {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Refresh token expired",
-		}
-	}
-
-	// Load user
-	user, err := a.loadUser(ctx, session.UserID)
-	if err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "User not found",
-		}
-	}
-
-	// Check user status
-	if status := a.checkUserStatus(user); !status.Allowed {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  status.Message,
-		}
-	}
-
-	// Generate new access token from refresh token
-	newAccessToken, err := a.generateAccessToken(user.ID, user.Username, string(user.Role))
-	if err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Failed to generate new token",
-		}
-	}
-
-	// Rotate refresh token (update session)
-	newRefreshToken, err := a.generateRefreshToken()
-	if err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Failed to generate new refresh token",
-		}
-	}
-
-	session.RefreshToken = newRefreshToken
-	session.ExpiresAt = time.Now().Add(a.config.RefreshExpiry)
-	if err := a.config.SessionRepo.Update(ctx, session); err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Failed to update session",
-		}
-	}
-
-	a.logAudit(ctx, &AuditLogEntry{
-		UserID:   user.ID,
-		Username: user.Username,
-		Action:   "refresh_auth",
-		AuthType: AuthTypeRefresh,
-		IP:       getClientIP(r),
-		UserAgent: r.UserAgent(),
-		Success:  true,
-		Timestamp: time.Now(),
-	})
-
-	return AuthenticateResult{
-		Authenticated: true,
-		User:          user,
-		Token:         newAccessToken,
-		SessionID:     session.ID,
-		AuthType:      AuthTypeRefresh,
-		MFAVerified:   true,
-	}
-}
-
-// authenticateAPIKey validates an API key.
-func (a *AuthMiddleware) authenticateAPIKey(ctx context.Context, apiKey string, r *http.Request) AuthenticateResult {
-	if a.config.RedisClient == nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "API key authentication not configured",
-		}
-	}
-
-	// Get user ID from Redis
-	key := "api_key:" + apiKey
-	userID, err := a.config.RedisClient.Get(ctx, key).Result()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return AuthenticateResult{
-				Authenticated: false,
-				ErrorMessage:  "Invalid API key",
-			}
-		}
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "Internal server error",
-		}
-	}
-
-	// Load user
-	user, err := a.loadUser(ctx, userID)
-	if err != nil {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  "User not found",
-		}
-	}
-
-	// Check user status
-	if status := a.checkUserStatus(user); !status.Allowed {
-		return AuthenticateResult{
-			Authenticated: false,
-			ErrorMessage:  status.Message,
-		}
-	}
-
-	a.logAudit(ctx, &AuditLogEntry{
-		UserID:   user.ID,
-		Username: user.Username,
-		Action:   "api_key_auth",
-		AuthType: AuthTypeAPIKey,
-		IP:       getClientIP(r),
-		UserAgent: r.UserAgent(),
-		Success:  true,
-		Timestamp: time.Now(),
-	})
-
-	return AuthenticateResult{
-		Authenticated: true,
-		User:          user,
-		APIToken:      apiKey,
-		AuthType:      AuthTypeAPIKey,
-		MFAVerified:   true,
-	}
-}
-
-// validateSession checks if the session exists and is valid.
-func (a *AuthMiddleware) validateSession(ctx context.Context, userID string, claims jwt.MapClaims) (bool, error) {
-	if a.config.SessionRepo == nil {
-		return true, nil
-	}
-	// Get all active sessions
-	sessions, err := a.config.SessionRepo.GetByUserID(ctx, userID)
-	if err != nil {
-		return false, err
-	}
-	// If no sessions and we require sessions, reject
-	if len(sessions) == 0 {
-		return false, nil
-	}
-	// Check if any session matches the token (we can check by comparing issued time)
-	// For simplicity, we just check that at least one session exists
-	return true, nil
-}
-
-// checkMFA verifies MFA status (hook for MFA implementation).
-func (a *AuthMiddleware) checkMFA(ctx context.Context, userID string, claims jwt.MapClaims) bool {
-	if !a.config.EnableMFA {
-		return true
-	}
-	// Check if MFA claim exists and is true
-	if mfaClaim, ok := claims["mfa_verified"].(bool); ok {
-		return mfaClaim
-	}
-	// Check if user has MFA enabled (would check in DB)
-	// For now, return true (MFA not required)
-	return true
-}
-
-// UserStatusResult holds user status check result.
-type UserStatusResult struct {
-	Allowed bool
-	Message string
-}
-
-// checkUserStatus validates user account status.
-func (a *AuthMiddleware) checkUserStatus(user *entities.User) UserStatusResult {
-	if user.IsSuspended {
-		return UserStatusResult{Allowed: false, Message: "Account suspended"}
-	}
-	if !user.IsActive {
-		return UserStatusResult{Allowed: false, Message: "Account inactive"}
-	}
-	if user.DeletedAt != nil {
-		return UserStatusResult{Allowed: false, Message: "Account deleted"}
-	}
-	return UserStatusResult{Allowed: true}
-}
-
-// extractAPIKey extracts API key from header or cookie.
-func (a *AuthMiddleware) extractAPIKey(r *http.Request) string {
-	if key := r.Header.Get(a.config.APIHeaderName); key != "" {
-		return key
-	}
-	if cookie, err := r.Cookie(a.config.APICookieName); err == nil && cookie.Value != "" {
-		return cookie.Value
-	}
-	return ""
-}
-
-// extractRefreshToken extracts refresh token from cookie or body.
-func (a *AuthMiddleware) extractRefreshToken(r *http.Request) string {
-	if cookie, err := r.Cookie(a.config.RefreshCookieName); err == nil && cookie.Value != "" {
-		return cookie.Value
-	}
-	return ""
-}
-
-// extractToken extracts JWT token from request using configured methods.
+// extractToken extracts JWT token from various sources.
 func (a *AuthMiddleware) extractToken(r *http.Request) string {
-	for _, lookup := range a.config.TokenLookup {
-		switch lookup {
-		case "header":
-			if token := a.extractFromHeader(r); token != "" {
-				return token
-			}
-		case "cookie":
-			if token := a.extractFromCookie(r); token != "" {
-				return token
-			}
-		case "query":
-			if token := a.extractFromQuery(r); token != "" {
-				return token
-			}
+	// 1. Authorization header (Bearer)
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return strings.TrimSpace(parts[1])
 		}
 	}
+	
+	// 2. Cookie
+	if cookie, err := r.Cookie("access_token"); err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+	
+	// 3. Query parameter (for WebSocket, debugging)
+	if token := r.URL.Query().Get("token"); token != "" && a.config.AllowWebSocket {
+		return token
+	}
+	
+	// 4. Custom header
+	if token := r.Header.Get("X-Access-Token"); token != "" {
+		return token
+	}
+	
 	return ""
 }
 
-// extractFromHeader extracts token from Authorization header.
-func (a *AuthMiddleware) extractFromHeader(r *http.Request) string {
-	authHeader := r.Header.Get(a.config.HeaderName)
-	if authHeader == "" {
-		return ""
+// extractTokenFromWebSocket extracts token from WebSocket request.
+func (a *AuthMiddleware) extractTokenFromWebSocket(conn *websocket.Conn) string {
+	// WebSocket handshake headers
+	authHeader := conn.Request().Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return strings.TrimSpace(parts[1])
+		}
 	}
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-		return parts[1]
-	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	return ""
+	// Query param
+	return conn.Request().URL.Query().Get("token")
 }
 
-// extractFromCookie extracts token from cookie.
-func (a *AuthMiddleware) extractFromCookie(r *http.Request) string {
-	cookie, err := r.Cookie(a.config.CookieName)
-	if err != nil || cookie.Value == "" {
-		return ""
-	}
-	return cookie.Value
-}
-
-// extractFromQuery extracts token from query parameter.
-func (a *AuthMiddleware) extractFromQuery(r *http.Request) string {
-	return r.URL.Query().Get(a.config.QueryParamName)
-}
+// ======================================================================
+// Token Validation
+// ======================================================================
 
 // validateToken parses and validates the JWT token.
 func (a *AuthMiddleware) validateToken(tokenString string) (jwt.MapClaims, error) {
@@ -671,104 +264,327 @@ func (a *AuthMiddleware) validateToken(tokenString string) (jwt.MapClaims, error
 		return []byte(a.config.JWTSecret), nil
 	})
 	if err != nil {
-		return nil, err
+		// Check specific error types
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrTokenExpired
+		}
+		if errors.Is(err, jwt.ErrTokenMalformed) {
+			return nil, ErrTokenMalformed
+		}
+		if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+			return nil, ErrTokenSignatureInvalid
+		}
+		return nil, fmt.Errorf("token validation failed: %w", err)
 	}
+	
 	if !token.Valid {
-		return nil, errors.New("invalid token")
+		return nil, ErrInvalidToken
 	}
+	
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, errors.New("invalid token claims")
+		return nil, ErrInvalidTokenClaims
 	}
-	// Verify expiration
+	
+	// Validate issuer
+	if a.config.JWTIssuer != "" {
+		if iss, ok := claims["iss"].(string); !ok || iss != a.config.JWTIssuer {
+			return nil, ErrInvalidIssuer
+		}
+	}
+	
+	// Validate audience
+	if a.config.JWTAudience != "" {
+		if aud, ok := claims["aud"].(string); !ok || aud != a.config.JWTAudience {
+			return nil, ErrInvalidAudience
+		}
+	}
+	
+	// Validate expiry
 	if exp, ok := claims["exp"].(float64); ok {
 		if time.Now().Unix() > int64(exp) {
-			return nil, jwt.ErrTokenExpired
+			return nil, ErrTokenExpired
 		}
 	} else {
-		return nil, errors.New("token missing expiration claim")
+		return nil, ErrMissingExpiry
 	}
+	
+	// Validate not before
+	if nbf, ok := claims["nbf"].(float64); ok {
+		if time.Now().Unix() < int64(nbf) {
+			return nil, ErrTokenNotYetValid
+		}
+	}
+	
 	return claims, nil
 }
 
-// generateAccessToken creates a new access token.
-func (a *AuthMiddleware) generateAccessToken(userID, username, role string) (string, error) {
-	claims := jwt.MapClaims{
-		"sub":  userID,
-		"user": username,
-		"role": role,
-		"exp":  time.Now().Add(a.config.JWTExpiry).Unix(),
-		"iat":  time.Now().Unix(),
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(a.config.JWTSecret))
-}
-
-// generateRefreshToken creates a random refresh token.
-func (a *AuthMiddleware) generateRefreshToken() (string, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.EncodeToString(bytes), nil
-}
+// ======================================================================
+// Token Blacklist
+// ======================================================================
 
 // isTokenBlacklisted checks if token is in Redis blacklist.
 func (a *AuthMiddleware) isTokenBlacklisted(ctx context.Context, token string) bool {
-	if a.config.RedisClient == nil {
+	if a.config.RedisAdapter == nil {
 		return false
 	}
-	key := "blacklist:" + token
-	val, err := a.config.RedisClient.Get(ctx, key).Result()
+	key := a.config.BlacklistPrefix + token
+	exists, err := a.config.RedisAdapter.Exists(ctx, key)
 	if err != nil {
-		if !errors.Is(err, redis.Nil) {
-			a.log.WithError(err).Warn("Failed to check token blacklist")
-		}
+		a.log.WithError(err).Warn("Failed to check token blacklist")
 		return false
 	}
-	return val != ""
+	return exists > 0
 }
 
-// getUserIDFromClaims extracts user ID from JWT claims.
-func (a *AuthMiddleware) getUserIDFromClaims(claims jwt.MapClaims) (string, error) {
-	sub, ok := claims["sub"].(string)
-	if !ok || sub == "" {
-		return "", errors.New("missing subject claim")
+// BlacklistToken adds a token to the blacklist with its remaining TTL.
+func (a *AuthMiddleware) BlacklistToken(ctx context.Context, token string) error {
+	if a.config.RedisAdapter == nil {
+		return errors.New("redis adapter not configured")
 	}
-	return sub, nil
+	
+	claims, err := a.validateToken(token)
+	if err != nil {
+		if errors.Is(err, ErrTokenExpired) {
+			// Already expired, no need to blacklist
+			return nil
+		}
+		return err
+	}
+	
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return errors.New("token missing expiry claim")
+	}
+	
+	ttl := time.Until(time.Unix(int64(exp), 0))
+	if ttl <= 0 {
+		return nil // Already expired
+	}
+	
+	key := a.config.BlacklistPrefix + token
+	if err := a.config.RedisAdapter.Set(ctx, key, "revoked", ttl); err != nil {
+		return fmt.Errorf("failed to blacklist token: %w", err)
+	}
+	
+	a.log.WithField("ttl", ttl).Debug("Token blacklisted")
+	return nil
 }
 
-// loadUser loads user from database or Redis cache.
+// ======================================================================
+// User Loading with Caching
+// ======================================================================
+
+// loadUser loads user from cache or database.
 func (a *AuthMiddleware) loadUser(ctx context.Context, userID string) (*entities.User, error) {
 	// Try cache first
-	if a.config.RedisClient != nil && a.config.UserCacheTTL > 0 {
-		cacheKey := "user:" + userID
-		cached, err := a.config.RedisClient.Get(ctx, cacheKey).Result()
-		if err == nil && cached != "" {
-			var user entities.User
-			if err := json.Unmarshal([]byte(cached), &user); err == nil {
-				return &user, nil
-			}
+	if a.config.EnableUserCache && a.config.RedisAdapter != nil {
+		cacheKey := a.config.UserCachePrefix + userID
+		var user entities.User
+		if err := a.config.RedisAdapter.GetJSON(ctx, cacheKey, &user); err == nil {
+			a.log.WithField("user_id", userID).Debug("User loaded from cache")
+			return &user, nil
 		}
 	}
+	
 	// Load from database
 	user, err := a.config.UserRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
+	
 	// Store in cache
-	if a.config.RedisClient != nil && a.config.UserCacheTTL > 0 {
-		cacheKey := "user:" + userID
-		data, err := json.Marshal(user)
-		if err == nil {
-			a.config.RedisClient.Set(ctx, cacheKey, data, a.config.UserCacheTTL)
+	if a.config.EnableUserCache && a.config.RedisAdapter != nil && a.config.UserCacheTTL > 0 {
+		cacheKey := a.config.UserCachePrefix + userID
+		if err := a.config.RedisAdapter.CacheSet(ctx, cacheKey, user, a.config.UserCacheTTL); err != nil {
+			a.log.WithError(err).Warn("Failed to cache user")
 		}
 	}
+	
 	return user, nil
 }
 
-// updateLastActive updates user's last active timestamp asynchronously.
+// InvalidateUserCache invalidates cached user data.
+func (a *AuthMiddleware) InvalidateUserCache(ctx context.Context, userID string) error {
+	if !a.config.EnableUserCache || a.config.RedisAdapter == nil {
+		return nil
+	}
+	cacheKey := a.config.UserCachePrefix + userID
+	return a.config.RedisAdapter.Delete(ctx, cacheKey)
+}
+
+// ======================================================================
+// User Status Validation
+// ======================================================================
+
+// validateUserStatus checks if user can authenticate.
+func (a *AuthMiddleware) validateUserStatus(user *entities.User) error {
+	if user == nil {
+		return errors.New("user is nil")
+	}
+	
+	if a.config.RequireUserActive && !user.IsActive {
+		return errors.New("user account is inactive")
+	}
+	
+	if user.IsSuspended {
+		return errors.New("user account is suspended")
+	}
+	
+	if a.config.RequireUserVerified && !user.IsVerified {
+		return errors.New("email not verified")
+	}
+	
+	if user.DeletedAt != nil {
+		return errors.New("user account has been deleted")
+	}
+	
+	return nil
+}
+
+// ======================================================================
+= Claim Extraction
+// ======================================================================
+
+// extractUserID extracts user ID from claims.
+func (a *AuthMiddleware) extractUserID(claims jwt.MapClaims) (string, error) {
+	// Try "sub" claim
+	if sub, ok := claims["sub"].(string); ok && sub != "" {
+		return sub, nil
+	}
+	// Try "user_id" claim
+	if userID, ok := claims["user_id"].(string); ok && userID != "" {
+		return userID, nil
+	}
+	// Try "id" claim
+	if id, ok := claims["id"].(string); ok && id != "" {
+		return id, nil
+	}
+	return "", errors.New("no user identifier found in claims")
+}
+
+// extractRole extracts role from claims or user.
+func (a *AuthMiddleware) extractRole(claims jwt.MapClaims, user *entities.User) entities.UserRole {
+	// Try claims first
+	if roleStr, ok := claims["role"].(string); ok && roleStr != "" {
+		switch entities.UserRole(roleStr) {
+		case entities.RoleAdmin, entities.RoleModerator, entities.RoleUser:
+			return entities.UserRole(roleStr)
+		}
+	}
+	// Fallback to user role
+	return user.Role
+}
+
+// ======================================================================
+// Permissions
+// ======================================================================
+
+// UserPermissions represents a user's permissions.
+type UserPermissions struct {
+	CanAdmin      bool `json:"can_admin"`
+	CanModerate   bool `json:"can_moderate"`
+	CanDelete     bool `json:"can_delete"`
+	CanBan        bool `json:"can_ban"`
+	CanViewReports bool `json:"can_view_reports"`
+	CanManageUsers bool `json:"can_manage_users"`
+	CanManageTweets bool `json:"can_manage_tweets"`
+}
+
+// buildPermissions builds permissions based on user role.
+func (a *AuthMiddleware) buildPermissions(user *entities.User, role entities.UserRole) *UserPermissions {
+	perms := &UserPermissions{}
+	
+	switch role {
+	case entities.RoleAdmin:
+		perms.CanAdmin = true
+		perms.CanModerate = true
+		perms.CanDelete = true
+		perms.CanBan = true
+		perms.CanViewReports = true
+		perms.CanManageUsers = true
+		perms.CanManageTweets = true
+		
+	case entities.RoleModerator:
+		perms.CanModerate = true
+		perms.CanDelete = true
+		perms.CanViewReports = true
+		perms.CanManageTweets = true
+		
+	default:
+		perms.CanModerate = false
+		perms.CanDelete = false
+	}
+	
+	return perms
+}
+
+// ======================================================================
+// Context Management
+// ======================================================================
+
+// setAuthenticatedContext sets the authenticated context.
+func (a *AuthMiddleware) setAuthenticatedContext(ctx context.Context, user *entities.User, role entities.UserRole, claims jwt.MapClaims, perms *UserPermissions, token string) context.Context {
+	ctx = context.WithValue(ctx, UserIDKey, user.ID)
+	ctx = context.WithValue(ctx, UserKey, user)
+	ctx = context.WithValue(ctx, UserRoleKey, role)
+	ctx = context.WithValue(ctx, UserClaimsKey, claims)
+	ctx = context.WithValue(ctx, UserPermissionsKey, perms)
+	ctx = context.WithValue(ctx, IsAuthenticatedKey, true)
+	ctx = context.WithValue(ctx, TokenKey, token)
+	return ctx
+}
+
+// setUnauthenticatedContext sets the unauthenticated context.
+func (a *AuthMiddleware) setUnauthenticatedContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, IsAuthenticatedKey, false)
+	return ctx
+}
+
+// ======================================================================
+// Error Types
+// ======================================================================
+
+var (
+	ErrTokenExpired          = errors.New("token has expired")
+	ErrTokenMalformed        = errors.New("token is malformed")
+	ErrTokenSignatureInvalid = errors.New("token signature is invalid")
+	ErrInvalidToken          = errors.New("token is invalid")
+	ErrInvalidTokenClaims    = errors.New("invalid token claims")
+	ErrInvalidIssuer         = errors.New("invalid token issuer")
+	ErrInvalidAudience       = errors.New("invalid token audience")
+	ErrMissingExpiry         = errors.New("token missing expiry claim")
+	ErrTokenNotYetValid      = errors.New("token not yet valid")
+)
+
+// ======================================================================
+// Response Helpers
+// ======================================================================
+
+// sendError sends an error response.
+func (a *AuthMiddleware) sendError(w http.ResponseWriter, status int, message, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	resp := map[string]interface{}{
+		"error":   message,
+		"code":    code,
+		"status":  status,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		a.log.WithError(err).Error("Failed to encode error response")
+	}
+}
+
+// ======================================================================
+= Background Tasks
+// ======================================================================
+
+// updateLastActive updates user's last active timestamp (async).
 func (a *AuthMiddleware) updateLastActive(userID string) {
+	if a.config.UserRepo == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := a.config.UserRepo.UpdateLastActive(ctx, userID); err != nil {
@@ -776,40 +592,9 @@ func (a *AuthMiddleware) updateLastActive(userID string) {
 	}
 }
 
-// logAudit logs authentication events.
-func (a *AuthMiddleware) logAudit(ctx context.Context, entry *AuditLogEntry) {
-	if !a.config.EnableAuditLog {
-		return
-	}
-	// Log to structured logger
-	a.log.WithFields(logrus.Fields{
-		"user_id":    entry.UserID,
-		"username":   entry.Username,
-		"action":     entry.Action,
-		"auth_type":  entry.AuthType,
-		"ip":         entry.IP,
-		"user_agent": entry.UserAgent,
-		"success":    entry.Success,
-		"error":      entry.Error,
-	}).Info("authentication event")
-	// Could also store in database for auditing
-}
-
-// sendError sends a JSON error response.
-func (a *AuthMiddleware) sendError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	response := map[string]interface{}{
-		"error":     message,
-		"status":    status,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		a.log.WithError(err).Error("Failed to encode error response")
-	}
-}
-
-// ---- Helper functions for retrieving user info from context ----
+// ======================================================================
+// Context Helper Functions (Public)
+// ======================================================================
 
 // GetUserID extracts user ID from context.
 func GetUserID(ctx context.Context) (string, error) {
@@ -863,33 +648,20 @@ func GetClaims(ctx context.Context) (jwt.MapClaims, error) {
 	return claims, nil
 }
 
-// GetToken extracts the raw JWT token from context.
-func GetToken(ctx context.Context) (string, error) {
-	val := ctx.Value(TokenKey)
+// GetPermissions extracts user permissions from context.
+func GetPermissions(ctx context.Context) (*UserPermissions, error) {
+	val := ctx.Value(UserPermissionsKey)
 	if val == nil {
-		return "", errors.New("token not found in context")
+		return nil, errors.New("permissions not found in context")
 	}
-	token, ok := val.(string)
+	perms, ok := val.(*UserPermissions)
 	if !ok {
-		return "", errors.New("invalid token type")
+		return nil, errors.New("invalid permissions type")
 	}
-	return token, nil
+	return perms, nil
 }
 
-// GetAuthType returns the authentication type used.
-func GetAuthType(ctx context.Context) (string, error) {
-	val := ctx.Value(AuthTypeKey)
-	if val == nil {
-		return "", errors.New("auth type not found in context")
-	}
-	authType, ok := val.(string)
-	if !ok {
-		return "", errors.New("invalid auth type")
-	}
-	return authType, nil
-}
-
-// IsAuthenticated checks if the request is authenticated.
+// IsAuthenticated checks if request is authenticated.
 func IsAuthenticated(ctx context.Context) bool {
 	val := ctx.Value(IsAuthenticatedKey)
 	if val == nil {
@@ -902,57 +674,76 @@ func IsAuthenticated(ctx context.Context) bool {
 	return auth
 }
 
-// HasPermission checks if the authenticated user has a specific permission.
-func HasPermission(ctx context.Context, permission string) (bool, error) {
-	user, err := GetUser(ctx)
-	if err != nil {
-		return false, err
+// GetToken returns the raw token from context.
+func GetToken(ctx context.Context) (string, error) {
+	val := ctx.Value(TokenKey)
+	if val == nil {
+		return "", errors.New("token not found in context")
 	}
-	permissions, ok := RolePermissions[user.Role]
+	token, ok := val.(string)
 	if !ok {
-		return false, nil
+		return "", errors.New("invalid token type")
 	}
-	for _, p := range permissions {
-		if p == permission {
-			return true, nil
-		}
-	}
-	return false, nil
+	return token, nil
 }
 
-// MustHavePermission returns a middleware that requires a specific permission.
-func MustHavePermission(permission string) mux.MiddlewareFunc {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			hasPermission, err := HasPermission(r.Context(), permission)
-			if err != nil || !hasPermission {
-				http.Error(w, "Forbidden", http.StatusForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// ---- Role-based authorization middleware ----
+// ======================================================================
+// Role-Based Authorization Middleware
+// ======================================================================
 
 // RequireRole returns a middleware that requires a specific role.
 func RequireRole(allowedRoles ...entities.UserRole) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			role, err := GetUserRole(r.Context())
+			userRole, err := GetUserRole(r.Context())
 			if err != nil {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
-			allowed := false
-			for _, allowedRole := range allowedRoles {
-				if role == allowedRole {
-					allowed = true
-					break
+			for _, role := range allowedRoles {
+				if userRole == role {
+					next.ServeHTTP(w, r)
+					return
 				}
 			}
-			if !allowed {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		})
+	}
+}
+
+// RequireAdmin is a shortcut for RequireRole(entities.RoleAdmin).
+func RequireAdmin(next http.Handler) http.Handler {
+	return RequireRole(entities.RoleAdmin)(next)
+}
+
+// RequireAdminOrModerator is a shortcut.
+func RequireAdminOrModerator(next http.Handler) http.Handler {
+	return RequireRole(entities.RoleAdmin, entities.RoleModerator)(next)
+}
+
+// RequirePermission returns a middleware that requires a specific permission.
+func RequirePermission(permission string) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			perms, err := GetPermissions(r.Context())
+			if err != nil {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			hasPermission := false
+			switch permission {
+			case "admin":
+				hasPermission = perms.CanAdmin
+			case "moderate":
+				hasPermission = perms.CanModerate
+			case "delete":
+				hasPermission = perms.CanDelete
+			case "ban":
+				hasPermission = perms.CanBan
+			default:
+				hasPermission = false
+			}
+			if !hasPermission {
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
@@ -961,124 +752,130 @@ func RequireRole(allowedRoles ...entities.UserRole) mux.MiddlewareFunc {
 	}
 }
 
-// RequireAdmin returns a middleware that requires admin role.
-func RequireAdmin(next http.Handler) http.Handler {
-	return RequireRole(entities.RoleAdmin)(next)
+// ======================================================================
+// Optional Authentication Wrapper
+// ======================================================================
+
+// OptionalAuth wraps a handler with optional authentication.
+func (a *AuthMiddleware) OptionalAuth(next http.Handler) http.Handler {
+	clone := *a
+	clone.config.AllowOptional = true
+	return clone.Middleware(next)
 }
 
-// RequireAdminOrModerator returns a middleware that requires admin or moderator.
-func RequireAdminOrModerator(next http.Handler) http.Handler {
-	return RequireRole(entities.RoleAdmin, entities.RoleModerator)(next)
-}
+// ======================================================================
+// WebSocket Authentication
+// ======================================================================
 
-// ---- Token management ----
-
-// BlacklistToken adds a token to the blacklist in Redis.
-func (a *AuthMiddleware) BlacklistToken(ctx context.Context, token string) error {
-	if a.config.RedisClient == nil {
-		return errors.New("Redis client not configured")
+// AuthenticateWebSocket authenticates a WebSocket connection.
+func (a *AuthMiddleware) AuthenticateWebSocket(conn *websocket.Conn) (*entities.User, error) {
+	tokenString := a.extractTokenFromWebSocket(conn)
+	if tokenString == "" {
+		return nil, errors.New("missing authentication token")
 	}
-	// Parse token to get expiry
-	claims, err := a.validateToken(token)
+	
+	claims, err := a.validateToken(tokenString)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return errors.New("token missing expiration")
+	
+	if a.config.EnableBlacklist && a.config.RedisAdapter != nil {
+		if a.isTokenBlacklisted(context.Background(), tokenString) {
+			return nil, errors.New("token revoked")
+		}
 	}
-	ttl := time.Until(time.Unix(int64(exp), 0))
-	if ttl <= 0 {
-		return nil
+	
+	userID, err := a.extractUserID(claims)
+	if err != nil {
+		return nil, err
 	}
-	key := "blacklist:" + token
-	return a.config.RedisClient.Set(ctx, key, "1", ttl).Err()
+	
+	user, err := a.loadUser(context.Background(), userID)
+	if err != nil {
+		return nil, err
+	}
+	
+	if err := a.validateUserStatus(user); err != nil {
+		return nil, err
+	}
+	
+	return user, nil
 }
 
-// ---- Test helpers ----
+// ======================================================================
+// Test Helpers
+// ======================================================================
 
-// WithUserContext creates a context with user information for testing.
+// WithUserContext creates a context with user info for testing.
 func WithUserContext(ctx context.Context, user *entities.User) context.Context {
+	perms := &UserPermissions{}
 	ctx = context.WithValue(ctx, UserIDKey, user.ID)
 	ctx = context.WithValue(ctx, UserKey, user)
 	ctx = context.WithValue(ctx, UserRoleKey, user.Role)
+	ctx = context.WithValue(ctx, UserPermissionsKey, perms)
 	ctx = context.WithValue(ctx, IsAuthenticatedKey, true)
 	return ctx
 }
 
 // WithAdminContext creates a context with admin user for testing.
 func WithAdminContext(ctx context.Context, admin *entities.User) context.Context {
+	admin.Role = entities.RoleAdmin
 	return WithUserContext(ctx, admin)
 }
 
-// ---- Route protection helper ----
-
-// ProtectRoute wraps a handler with auth middleware and optional role check.
-func (a *AuthMiddleware) ProtectRoute(handler http.Handler, roles ...entities.UserRole) http.Handler {
-	handler = a.Middleware(handler)
-	if len(roles) > 0 {
-		handler = RequireRole(roles...)(handler)
-	}
-	return handler
+// MockUserRepository for testing.
+type MockUserRepository struct {
+	Users map[string]*entities.User
+	Error error
 }
 
-// ---- Health check ----
+func (m *MockUserRepository) GetByID(ctx context.Context, id string) (*entities.User, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	if user, ok := m.Users[id]; ok {
+		return user, nil
+	}
+	return nil, interfaces.ErrUserNotFound
+}
 
-// HealthCheck returns the health status of the auth middleware.
+// ======================================================================
+// Health Check
+// ======================================================================
+
+// HealthCheck checks the health of the middleware dependencies.
 func (a *AuthMiddleware) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
-		"status":    "ok",
 		"component": "auth_middleware",
+		"status":    "ok",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}
-	if a.config.RedisClient != nil {
-		if err := a.config.RedisClient.Ping(r.Context()).Err(); err != nil {
+	
+	if a.config.RedisAdapter != nil {
+		if err := a.config.RedisAdapter.Ping(r.Context()); err != nil {
 			status["status"] = "degraded"
 			status["redis"] = "unavailable"
-			w.WriteHeader(http.StatusServiceUnavailable)
+			status["error"] = err.Error()
 		} else {
 			status["redis"] = "available"
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
-
-// ---- Permission helpers ----
-
-// CanModerate checks if the authenticated user can moderate content.
-func CanModerate(ctx context.Context) bool {
-	user, err := GetUser(ctx)
-	if err != nil {
-		return false
-	}
-	return user.IsModerator()
-}
-
-// CanAdmin checks if the user has admin access.
-func CanAdmin(ctx context.Context) bool {
-	user, err := GetUser(ctx)
-	if err != nil {
-		return false
-	}
-	return user.IsAdmin()
-}
-
-// ---- getClientIP ----
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
+	
+	if a.config.UserRepo != nil {
+		if err := a.config.UserRepo.Ping(r.Context()); err != nil {
+			status["status"] = "degraded"
+			status["database"] = "unavailable"
+			status["error"] = err.Error()
+		} else {
+			status["database"] = "available"
 		}
 	}
-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		return xrip
+	
+	w.Header().Set("Content-Type", "application/json")
+	if status["status"] == "ok" {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
+	json.NewEncoder(w).Encode(status)
 }
