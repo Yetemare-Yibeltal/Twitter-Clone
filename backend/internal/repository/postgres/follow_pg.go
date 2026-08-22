@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 
 	"twitter-clone/backend/internal/domain/entities"
@@ -80,24 +81,80 @@ func (r *followRepo) getDB() sqlx.ExtContext {
 // Create inserts a new follow relationship.
 func (r *followRepo) Create(ctx context.Context, follow *entities.Follow) error {
 	query := `
-		INSERT INTO follows (follower_id, followee_id, created_at)
-		VALUES ($1, $2, $3)
+		INSERT INTO follows (
+			id,
+			follower_id,
+			followee_id,
+			created_at
+		) VALUES ($1, $2, $3, $4)
 	`
 	_, err := r.getDB().ExecContext(ctx, query,
-		follow.FollowerID, follow.FolloweeID, follow.CreatedAt,
+		follow.ID,
+		follow.FollowerID,
+		follow.FolloweeID,
+		follow.CreatedAt,
 	)
 	if err != nil {
+		// Check for duplicate key violation
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return interfaces.ErrFollowAlreadyExists
+		}
 		return fmt.Errorf("create follow failed: %w", err)
 	}
 	return nil
 }
 
-// Delete removes a follow relationship.
-func (r *followRepo) Delete(ctx context.Context, followerID, followeeID string) error {
+// GetByID retrieves a follow by its ID.
+func (r *followRepo) GetByID(ctx context.Context, id string) (*entities.Follow, error) {
+	query := `SELECT * FROM follows WHERE id = $1`
+	var follow entities.Follow
+	err := r.getDB().GetContext(ctx, &follow, query, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, interfaces.ErrFollowNotFound
+		}
+		return nil, fmt.Errorf("get follow by ID failed: %w", err)
+	}
+	return &follow, nil
+}
+
+// GetByFollowerAndFollowee retrieves a follow by follower and followee IDs.
+func (r *followRepo) GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*entities.Follow, error) {
+	query := `
+		SELECT * FROM follows
+		WHERE follower_id = $1 AND followee_id = $2
+	`
+	var follow entities.Follow
+	err := r.getDB().GetContext(ctx, &follow, query, followerID, followeeID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, interfaces.ErrFollowNotFound
+		}
+		return nil, fmt.Errorf("get follow by follower and followee failed: %w", err)
+	}
+	return &follow, nil
+}
+
+// Delete removes a follow relationship by ID.
+func (r *followRepo) Delete(ctx context.Context, id string) error {
+	query := `DELETE FROM follows WHERE id = $1`
+	result, err := r.getDB().ExecContext(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("delete follow failed: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return interfaces.ErrFollowNotFound
+	}
+	return nil
+}
+
+// DeleteByFollowerAndFollowee removes a follow by follower and followee IDs.
+func (r *followRepo) DeleteByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) error {
 	query := `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`
 	result, err := r.getDB().ExecContext(ctx, query, followerID, followeeID)
 	if err != nil {
-		return fmt.Errorf("delete follow failed: %w", err)
+		return fmt.Errorf("delete follow by follower and followee failed: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
@@ -112,7 +169,12 @@ func (r *followRepo) Delete(ctx context.Context, followerID, followeeID string) 
 
 // Exists checks if a follow relationship exists.
 func (r *followRepo) Exists(ctx context.Context, followerID, followeeID string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM follows WHERE follower_id = $1 AND followee_id = $2)`
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM follows
+			WHERE follower_id = $1 AND followee_id = $2
+		)
+	`
 	var exists bool
 	err := r.getDB().GetContext(ctx, &exists, query, followerID, followeeID)
 	if err != nil {
@@ -147,27 +209,65 @@ func (r *followRepo) CountFollowing(ctx context.Context, userID string) (int64, 
 	return count, nil
 }
 
-// CountMutual returns the number of mutual follows between two users.
-func (r *followRepo) CountMutual(ctx context.Context, userID1, userID2 string) (int64, error) {
-	query := `
-		SELECT COUNT(*)
-		FROM follows f1
-		JOIN follows f2 ON f1.followee_id = f2.follower_id
-		WHERE f1.follower_id = $1 AND f2.followee_id = $2
-	`
-	var count int64
-	err := r.getDB().GetContext(ctx, &count, query, userID1, userID2)
-	if err != nil {
-		return 0, fmt.Errorf("count mutual follows failed: %w", err)
+// CountFollowersByUserIDs returns follower counts for multiple users (bulk).
+func (r *followRepo) CountFollowersByUserIDs(ctx context.Context, userIDs []string) (map[string]int64, error) {
+	if len(userIDs) == 0 {
+		return map[string]int64{}, nil
 	}
-	return count, nil
+	query := `
+		SELECT followee_id, COUNT(*) as count
+		FROM follows
+		WHERE followee_id = ANY($1)
+		GROUP BY followee_id
+	`
+	var results []struct {
+		FolloweeID string `db:"followee_id"`
+		Count      int64  `db:"count"`
+	}
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
+	if err != nil {
+		return nil, fmt.Errorf("count followers by user IDs failed: %w", err)
+	}
+
+	counts := make(map[string]int64, len(results))
+	for _, r := range results {
+		counts[r.FolloweeID] = r.Count
+	}
+	return counts, nil
+}
+
+// CountFollowingByUserIDs returns following counts for multiple users (bulk).
+func (r *followRepo) CountFollowingByUserIDs(ctx context.Context, userIDs []string) (map[string]int64, error) {
+	if len(userIDs) == 0 {
+		return map[string]int64{}, nil
+	}
+	query := `
+		SELECT follower_id, COUNT(*) as count
+		FROM follows
+		WHERE follower_id = ANY($1)
+		GROUP BY follower_id
+	`
+	var results []struct {
+		FollowerID string `db:"follower_id"`
+		Count      int64  `db:"count"`
+	}
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
+	if err != nil {
+		return nil, fmt.Errorf("count following by user IDs failed: %w", err)
+	}
+
+	counts := make(map[string]int64, len(results))
+	for _, r := range results {
+		counts[r.FollowerID] = r.Count
+	}
+	return counts, nil
 }
 
 // ======================================================================
 // List Operations
 // ======================================================================
 
-// GetFollowers returns the list of users following a user with pagination.
+// GetFollowers returns all followers of a user with pagination.
 func (r *followRepo) GetFollowers(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error) {
 	if limit < 1 {
 		limit = 20
@@ -177,9 +277,9 @@ func (r *followRepo) GetFollowers(ctx context.Context, userID string, cursor str
 		WHERE followee_id = $1
 	`
 	if cursor != "" {
-		query += ` AND follower_id > $2`
+		query += ` AND id > $2`
 	}
-	query += ` ORDER BY created_at DESC, follower_id DESC LIMIT $?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
 
 	args := []interface{}{userID}
 	argIndex := 2
@@ -198,12 +298,12 @@ func (r *followRepo) GetFollowers(ctx context.Context, userID string, cursor str
 
 	var nextCursor string
 	if len(follows) == limit {
-		nextCursor = follows[len(follows)-1].FollowerID
+		nextCursor = follows[len(follows)-1].ID
 	}
 	return follows, nextCursor, nil
 }
 
-// GetFollowing returns the list of users a user is following with pagination.
+// GetFollowing returns all users a user is following with pagination.
 func (r *followRepo) GetFollowing(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error) {
 	if limit < 1 {
 		limit = 20
@@ -213,9 +313,9 @@ func (r *followRepo) GetFollowing(ctx context.Context, userID string, cursor str
 		WHERE follower_id = $1
 	`
 	if cursor != "" {
-		query += ` AND followee_id > $2`
+		query += ` AND id > $2`
 	}
-	query += ` ORDER BY created_at DESC, followee_id DESC LIMIT $?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
 
 	args := []interface{}{userID}
 	argIndex := 2
@@ -234,14 +334,18 @@ func (r *followRepo) GetFollowing(ctx context.Context, userID string, cursor str
 
 	var nextCursor string
 	if len(follows) == limit {
-		nextCursor = follows[len(follows)-1].FolloweeID
+		nextCursor = follows[len(follows)-1].ID
 	}
 	return follows, nextCursor, nil
 }
 
-// GetFollowerIDs returns all follower IDs for a user (no pagination, for internal use).
+// GetFollowerIDs returns all follower IDs of a user.
 func (r *followRepo) GetFollowerIDs(ctx context.Context, userID string) ([]string, error) {
-	query := `SELECT follower_id FROM follows WHERE followee_id = $1 ORDER BY created_at DESC`
+	query := `
+		SELECT follower_id FROM follows
+		WHERE followee_id = $1
+		ORDER BY created_at DESC
+	`
 	var ids []string
 	err := r.getDB().SelectContext(ctx, &ids, query, userID)
 	if err != nil {
@@ -250,9 +354,13 @@ func (r *followRepo) GetFollowerIDs(ctx context.Context, userID string) ([]strin
 	return ids, nil
 }
 
-// GetFollowingIDs returns all following IDs for a user (no pagination).
+// GetFollowingIDs returns all user IDs a user is following.
 func (r *followRepo) GetFollowingIDs(ctx context.Context, userID string) ([]string, error) {
-	query := `SELECT followee_id FROM follows WHERE follower_id = $1 ORDER BY created_at DESC`
+	query := `
+		SELECT followee_id FROM follows
+		WHERE follower_id = $1
+		ORDER BY created_at DESC
+	`
 	var ids []string
 	err := r.getDB().SelectContext(ctx, &ids, query, userID)
 	if err != nil {
@@ -261,67 +369,105 @@ func (r *followRepo) GetFollowingIDs(ctx context.Context, userID string) ([]stri
 	return ids, nil
 }
 
+// GetFollowerIDsBatch returns follower IDs for multiple users (bulk).
+func (r *followRepo) GetFollowerIDsBatch(ctx context.Context, userIDs []string) (map[string][]string, error) {
+	if len(userIDs) == 0 {
+		return map[string][]string{}, nil
+	}
+	query := `
+		SELECT followee_id, follower_id
+		FROM follows
+		WHERE followee_id = ANY($1)
+		ORDER BY created_at DESC
+	`
+	var results []struct {
+		FolloweeID string `db:"followee_id"`
+		FollowerID string `db:"follower_id"`
+	}
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
+	if err != nil {
+		return nil, fmt.Errorf("get follower IDs batch failed: %w", err)
+	}
+
+	followerMap := make(map[string][]string)
+	for _, r := range results {
+		followerMap[r.FolloweeID] = append(followerMap[r.FolloweeID], r.FollowerID)
+	}
+	return followerMap, nil
+}
+
+// GetFollowingIDsBatch returns following IDs for multiple users (bulk).
+func (r *followRepo) GetFollowingIDsBatch(ctx context.Context, userIDs []string) (map[string][]string, error) {
+	if len(userIDs) == 0 {
+		return map[string][]string{}, nil
+	}
+	query := `
+		SELECT follower_id, followee_id
+		FROM follows
+		WHERE follower_id = ANY($1)
+		ORDER BY created_at DESC
+	`
+	var results []struct {
+		FollowerID string `db:"follower_id"`
+		FolloweeID string `db:"followee_id"`
+	}
+	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
+	if err != nil {
+		return nil, fmt.Errorf("get following IDs batch failed: %w", err)
+	}
+
+	followingMap := make(map[string][]string)
+	for _, r := range results {
+		followingMap[r.FollowerID] = append(followingMap[r.FollowerID], r.FolloweeID)
+	}
+	return followingMap, nil
+}
+
 // ======================================================================
-= Mutual Follows
+// Mutual Follows
 // ======================================================================
 
-// AreMutual checks if two users follow each other.
-func (r *followRepo) AreMutual(ctx context.Context, userID1, userID2 string) (bool, error) {
+// GetMutualFollows returns users that two users both follow.
+func (r *followRepo) GetMutualFollows(ctx context.Context, userID1, userID2 string) ([]string, error) {
 	query := `
-		SELECT EXISTS (
-			SELECT 1 FROM follows WHERE follower_id = $1 AND followee_id = $2
-		) AND EXISTS (
-			SELECT 1 FROM follows WHERE follower_id = $2 AND followee_id = $1
+		SELECT followee_id
+		FROM follows f1
+		WHERE f1.follower_id = $1
+		AND EXISTS (
+			SELECT 1 FROM follows f2
+			WHERE f2.follower_id = $2
+			AND f2.followee_id = f1.followee_id
 		)
 	`
-	var mutual bool
-	err := r.getDB().GetContext(ctx, &mutual, query, userID1, userID2)
+	var ids []string
+	err := r.getDB().SelectContext(ctx, &ids, query, userID1, userID2)
+	if err != nil {
+		return nil, fmt.Errorf("get mutual follows failed: %w", err)
+	}
+	return ids, nil
+}
+
+// IsMutualFollow checks if two users follow each other.
+func (r *followRepo) IsMutualFollow(ctx context.Context, userID1, userID2 string) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM follows
+			WHERE follower_id = $1 AND followee_id = $2
+		) AND EXISTS (
+			SELECT 1 FROM follows
+			WHERE follower_id = $2 AND followee_id = $1
+		)
+	`
+	var isMutual bool
+	err := r.getDB().GetContext(ctx, &isMutual, query, userID1, userID2)
 	if err != nil {
 		return false, fmt.Errorf("check mutual follow failed: %w", err)
 	}
-	return mutual, nil
-}
-
-// GetMutualFollows returns the list of mutual follows between two users.
-func (r *followRepo) GetMutualFollows(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]string, string, error) {
-	if limit < 1 {
-		limit = 20
-	}
-	query := `
-		SELECT f1.followee_id as user_id
-		FROM follows f1
-		JOIN follows f2 ON f1.followee_id = f2.follower_id
-		WHERE f1.follower_id = $1 AND f2.followee_id = $2
-	`
-	if cursor != "" {
-		query += ` AND f1.followee_id > $3`
-	}
-	query += ` ORDER BY f1.created_at DESC, f1.followee_id DESC LIMIT $?`
-
-	args := []interface{}{userID1, userID2}
-	argIndex := 3
-	if cursor != "" {
-		args = append(args, cursor)
-		argIndex = 4
-	}
-	args = append(args, limit)
-	query = r.getDB().Rebind(query)
-
-	var ids []string
-	err := r.getDB().SelectContext(ctx, &ids, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("get mutual follows failed: %w", err)
-	}
-
-	var nextCursor string
-	if len(ids) == limit {
-		nextCursor = ids[len(ids)-1]
-	}
-	return ids, nextCursor, nil
+	return isMutual, nil
 }
 
 // ======================================================================
-= Bulk Operations
+// Bulk Operations
 // ======================================================================
 
 // BulkCreate inserts multiple follows in a single transaction.
@@ -336,8 +482,12 @@ func (r *followRepo) BulkCreate(ctx context.Context, follows []*entities.Follow)
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO follows (follower_id, followee_id, created_at)
-		VALUES ($1, $2, $3)
+		INSERT INTO follows (
+			id,
+			follower_id,
+			followee_id,
+			created_at
+		) VALUES ($1, $2, $3, $4)
 	`)
 	if err != nil {
 		return err
@@ -345,8 +495,16 @@ func (r *followRepo) BulkCreate(ctx context.Context, follows []*entities.Follow)
 	defer stmt.Close()
 
 	for _, f := range follows {
-		_, err := stmt.ExecContext(ctx, f.FollowerID, f.FolloweeID, f.CreatedAt)
+		_, err := stmt.ExecContext(ctx,
+			f.ID,
+			f.FollowerID,
+			f.FolloweeID,
+			f.CreatedAt,
+		)
 		if err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+				continue // Skip duplicates
+			}
 			return fmt.Errorf("bulk create follow failed: %w", err)
 		}
 	}
@@ -354,106 +512,128 @@ func (r *followRepo) BulkCreate(ctx context.Context, follows []*entities.Follow)
 }
 
 // BulkDelete removes multiple follows in a single transaction.
-func (r *followRepo) BulkDelete(ctx context.Context, followerIDs []string, followeeIDs []string) error {
-	if len(followerIDs) == 0 || len(followeeIDs) == 0 {
+func (r *followRepo) BulkDelete(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
 		return nil
 	}
-	// Use a composite IN query: (follower_id, followee_id) IN ((?,?),(?,?)...)
-	// For simplicity, we'll delete one by one in a transaction.
-	tx, err := r.db.BeginTxx(ctx, nil)
+	query, args, err := sqlx.In(`DELETE FROM follows WHERE id IN (?)`, ids)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx, `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`)
+	query = r.getDB().Rebind(query)
+	_, err = r.getDB().ExecContext(ctx, query, args...)
 	if err != nil {
-		return err
+		return fmt.Errorf("bulk delete follows failed: %w", err)
 	}
-	defer stmt.Close()
-
-	for i := range followerIDs {
-		_, err := stmt.ExecContext(ctx, followerIDs[i], followeeIDs[i])
-		if err != nil {
-			return fmt.Errorf("bulk delete follow failed: %w", err)
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
-// BulkDeleteByUserID removes all follows where the user is either follower or followee.
-func (r *followRepo) BulkDeleteByUserID(ctx context.Context, userID string) error {
-	query := `DELETE FROM follows WHERE follower_id = $1 OR followee_id = $1`
-	_, err := r.getDB().ExecContext(ctx, query, userID)
+// BulkDeleteByFollower removes all follows made by a user.
+func (r *followRepo) BulkDeleteByFollower(ctx context.Context, followerID string) error {
+	query := `DELETE FROM follows WHERE follower_id = $1`
+	_, err := r.getDB().ExecContext(ctx, query, followerID)
 	if err != nil {
-		return fmt.Errorf("bulk delete by user failed: %w", err)
+		return fmt.Errorf("bulk delete by follower failed: %w", err)
+	}
+	return nil
+}
+
+// BulkDeleteByFollowee removes all follows targeted at a user.
+func (r *followRepo) BulkDeleteByFollowee(ctx context.Context, followeeID string) error {
+	query := `DELETE FROM follows WHERE followee_id = $1`
+	_, err := r.getDB().ExecContext(ctx, query, followeeID)
+	if err != nil {
+		return fmt.Errorf("bulk delete by followee failed: %w", err)
 	}
 	return nil
 }
 
 // ======================================================================
-= Advanced Queries
+// Advanced Queries
 // ======================================================================
 
-// GetFollowRecommendations returns suggested users to follow based on mutual follows.
-func (r *followRepo) GetFollowRecommendations(ctx context.Context, userID string, limit int) ([]string, error) {
+// GetTopFollowedUsers returns the most followed users.
+func (r *followRepo) GetTopFollowedUsers(ctx context.Context, limit int) ([]*entities.User, error) {
 	if limit < 1 {
 		limit = 10
 	}
-	// Find users followed by people that the user follows, excluding already followed and self.
 	query := `
-		SELECT DISTINCT f2.followee_id
-		FROM follows f1
-		JOIN follows f2 ON f1.followee_id = f2.follower_id
-		WHERE f1.follower_id = $1
-		  AND f2.followee_id != $1
-		  AND f2.followee_id NOT IN (SELECT followee_id FROM follows WHERE follower_id = $1)
-		ORDER BY RANDOM()
-		LIMIT $2
+		SELECT u.*
+		FROM users u
+		JOIN follows f ON u.id = f.followee_id
+		WHERE u.deleted_at IS NULL
+		GROUP BY u.id
+		ORDER BY COUNT(f.id) DESC
+		LIMIT $1
 	`
-	var ids []string
-	err := r.getDB().SelectContext(ctx, &ids, query, userID, limit)
+	var users []*entities.User
+	err := r.getDB().SelectContext(ctx, &users, query, limit)
 	if err != nil {
-		return nil, fmt.Errorf("get follow recommendations failed: %w", err)
+		return nil, fmt.Errorf("get top followed users failed: %w", err)
 	}
-	return ids, nil
+	return users, nil
 }
 
-// GetFollowCountsForUsers returns follower and following counts for multiple users (bulk).
-func (r *followRepo) GetFollowCountsForUsers(ctx context.Context, userIDs []string) (map[string]FollowCounts, error) {
+// GetTopFollowingUsers returns users who follow the most people.
+func (r *followRepo) GetTopFollowingUsers(ctx context.Context, limit int) ([]*entities.User, error) {
+	if limit < 1 {
+		limit = 10
+	}
+	query := `
+		SELECT u.*
+		FROM users u
+		JOIN follows f ON u.id = f.follower_id
+		WHERE u.deleted_at IS NULL
+		GROUP BY u.id
+		ORDER BY COUNT(f.id) DESC
+		LIMIT $1
+	`
+	var users []*entities.User
+	err := r.getDB().SelectContext(ctx, &users, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get top following users failed: %w", err)
+	}
+	return users, nil
+}
+
+// GetFollowTimeline returns follows in reverse chronological order for a user's feed.
+func (r *followRepo) GetFollowTimeline(ctx context.Context, userIDs []string, cursor string, limit int) ([]*entities.Follow, string, error) {
 	if len(userIDs) == 0 {
-		return map[string]FollowCounts{}, nil
+		return []*entities.Follow{}, "", nil
+	}
+	if limit < 1 {
+		limit = 20
 	}
 	query := `
-		SELECT 
-			user_id,
-			(SELECT COUNT(*) FROM follows WHERE followee_id = user_id) as followers,
-			(SELECT COUNT(*) FROM follows WHERE follower_id = user_id) as following
-		FROM (
-			SELECT unnest($1::text[]) as user_id
-		) t
+		SELECT f.*
+		FROM follows f
+		WHERE f.follower_id = ANY($1)
 	`
-	// Using unnest with array parameter; sqlx supports this.
-	var results []struct {
-		UserID    string `db:"user_id"`
-		Followers int64  `db:"followers"`
-		Following int64  `db:"following"`
+	if cursor != "" {
+		query += ` AND f.id > $2`
 	}
-	err := r.getDB().SelectContext(ctx, &results, query, pq.Array(userIDs))
-	if err != nil {
-		return nil, fmt.Errorf("get follow counts for users failed: %w", err)
-	}
-	counts := make(map[string]FollowCounts, len(results))
-	for _, r := range results {
-		counts[r.UserID] = FollowCounts{Followers: r.Followers, Following: r.Following}
-	}
-	return counts, nil
-}
+	query += ` ORDER BY f.created_at DESC, f.id DESC LIMIT $?`
 
-// FollowCounts holds follower and following counts.
-type FollowCounts struct {
-	Followers int64 `db:"followers"`
-	Following int64 `db:"following"`
+	args := []interface{}{pq.Array(userIDs)}
+	argIndex := 2
+	if cursor != "" {
+		args = append(args, cursor)
+		argIndex = 3
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var follows []*entities.Follow
+	err := r.getDB().SelectContext(ctx, &follows, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get follow timeline failed: %w", err)
+	}
+
+	var nextCursor string
+	if len(follows) == limit {
+		nextCursor = follows[len(follows)-1].ID
+	}
+	return follows, nextCursor, nil
 }
 
 // ======================================================================
@@ -465,8 +645,8 @@ func (r *followRepo) GetFollowStats(ctx context.Context) (*FollowStats, error) {
 	query := `
 		SELECT 
 			COUNT(*) as total_follows,
-			COUNT(DISTINCT follower_id) as unique_followers,
-			COUNT(DISTINCT followee_id) as unique_followees,
+			COUNT(DISTINCT follower_id) as total_followers,
+			COUNT(DISTINCT followee_id) as total_followees,
 			MAX(created_at) as last_follow,
 			MIN(created_at) as first_follow
 		FROM follows
@@ -482,8 +662,8 @@ func (r *followRepo) GetFollowStats(ctx context.Context) (*FollowStats, error) {
 // FollowStats represents aggregated follow statistics.
 type FollowStats struct {
 	TotalFollows   int64     `db:"total_follows"`
-	UniqueFollowers int64    `db:"unique_followers"`
-	UniqueFollowees int64    `db:"unique_followees"`
+	TotalFollowers int64     `db:"total_followers"`
+	TotalFollowees int64     `db:"total_followees"`
 	LastFollow     time.Time `db:"last_follow"`
 	FirstFollow    time.Time `db:"first_follow"`
 }
