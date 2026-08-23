@@ -88,7 +88,7 @@ func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool
 // @Param status query string false "Filter by status (active, suspended, inactive)"
 // @Param role query string false "Filter by role (user, moderator, admin)"
 // @Param search query string false "Search by username or full name"
-// @Success 200 {object} dto.UserListResponse
+// @Success 200 {object} dto.AdminUserListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -340,7 +340,7 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 // @Param status query string false "Filter by status (active, deleted, reported)"
 // @Param user_id query string false "Filter by user ID"
 // @Param search query string false "Search by content"
-// @Success 200 {object} dto.TweetListResponse
+// @Success 200 {object} dto.AdminTweetListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -570,7 +570,7 @@ func (h *AdminHandler) UnpinTweet(w http.ResponseWriter, r *http.Request) {
 // @Param status query string false "Filter by status (pending, under_review, resolved, dismissed)"
 // @Param severity query string false "Filter by severity (low, medium, high, critical)"
 // @Param target_type query string false "Filter by target type (tweet, user, comment)"
-// @Success 200 {object} dto.ReportListResponse
+// @Success 200 {object} dto.AdminReportListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -610,7 +610,7 @@ func (h *AdminHandler) ListReports(w http.ResponseWriter, r *http.Request) {
 // @Tags admin
 // @Security BearerAuth
 // @Param id path string true "Report ID"
-// @Success 200 {object} dto.ReportDetailResponse
+// @Success 200 {object} dto.AdminReportDetailResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
