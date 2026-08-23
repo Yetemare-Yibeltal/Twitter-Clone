@@ -1010,7 +1010,7 @@ func (h *AdminHandler) GetReportAnalytics(w http.ResponseWriter, r *http.Request
 }
 
 // ======================================================================
-// Helper Methods
+= Helper Methods
 // ======================================================================
 
 // sendSuccess writes a success response.
