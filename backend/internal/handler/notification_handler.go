@@ -51,6 +51,7 @@ func NewNotificationHandler(
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param unread_only query bool false "Only return unread notifications"
+// @Param type query string false "Filter by notification type (like, retweet, follow, reply, mention, quote)"
 // @Success 200 {object} dto.NotificationListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -68,6 +69,7 @@ func (h *NotificationHandler) GetNotifications(w http.ResponseWriter, r *http.Re
 		limit = 20
 	}
 	unreadOnly, _ := strconv.ParseBool(r.URL.Query().Get("unread_only"))
+	filterType := r.URL.Query().Get("type")
 
 	var notifications []*entities.Notification
 	var nextCursor string
@@ -75,6 +77,8 @@ func (h *NotificationHandler) GetNotifications(w http.ResponseWriter, r *http.Re
 
 	if unreadOnly {
 		notifications, nextCursor, total, err = h.notificationService.GetUnreadByUserID(r.Context(), userID, cursor, limit)
+	} else if filterType != "" {
+		notifications, nextCursor, total, err = h.notificationService.GetByUserIDAndType(r.Context(), userID, filterType, cursor, limit)
 	} else {
 		notifications, nextCursor, total, err = h.notificationService.GetByUserID(r.Context(), userID, cursor, limit)
 	}
@@ -126,8 +130,12 @@ func (h *NotificationHandler) GetUnreadCount(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Get breakdown by type for the user
+	typeBreakdown, _ := h.notificationService.GetUnreadBreakdown(r.Context(), userID)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"unread_count": count,
+		"unread_count":   count,
+		"type_breakdown": typeBreakdown,
 	})
 }
 
@@ -198,6 +206,14 @@ func (h *NotificationHandler) MarkAllAsRead(w http.ResponseWriter, r *http.Reque
 	if err := h.notificationService.MarkAllAsRead(r.Context(), userID); err != nil {
 		h.handleServiceError(w, err, "Failed to mark all as read")
 		return
+	}
+
+	// Clear WebSocket unread notification count for the user
+	if h.wsHub != nil {
+		h.wsHub.BroadcastToUser(userID, map[string]interface{}{
+			"type":         "unread_cleared",
+			"timestamp":    time.Now().Unix(),
+		})
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
@@ -483,18 +499,19 @@ func (h *NotificationHandler) UpdateNotificationSettings(w http.ResponseWriter, 
 = Get Admin Notification Stats
 // ======================================================================
 
-// GetAdminNotificationStats handles retrieving global notification statistics.
-// @Summary Get global notification stats
+// AdminGetNotificationStats handles retrieving global notification statistics.
+// @Summary Admin get global notification stats
 // @Description Retrieves global notification statistics (admin only)
-// @Tags notifications
+// @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Success 200 {object} dto.NotificationStatsResponse
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.GlobalNotificationStatsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/admin/notifications/stats [get]
-func (h *NotificationHandler) GetAdminNotificationStats(w http.ResponseWriter, r *http.Request) {
+func (h *NotificationHandler) AdminGetNotificationStats(w http.ResponseWriter, r *http.Request) {
 	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
@@ -502,7 +519,12 @@ func (h *NotificationHandler) GetAdminNotificationStats(w http.ResponseWriter, r
 		return
 	}
 
-	stats, err := h.notificationService.GetNotificationStats(r.Context())
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	stats, err := h.notificationService.AdminGetNotificationStats(r.Context(), days)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get global notification stats")
 		return
@@ -512,13 +534,13 @@ func (h *NotificationHandler) GetAdminNotificationStats(w http.ResponseWriter, r
 }
 
 // ======================================================================
-= WebSocket Broadcast (Admin only)
+= Admin Broadcast Notification (WebSocket)
 // ======================================================================
 
-// BroadcastNotification handles broadcasting a notification via WebSocket.
-// @Summary Broadcast notification
+// AdminBroadcastNotification handles broadcasting a notification via WebSocket.
+// @Summary Admin broadcast notification
 // @Description Sends a notification to a user via WebSocket (admin only)
-// @Tags notifications
+// @Tags admin
 // @Security BearerAuth
 // @Accept json
 // @Produce json
@@ -529,7 +551,7 @@ func (h *NotificationHandler) GetAdminNotificationStats(w http.ResponseWriter, r
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/admin/notifications/broadcast [post]
-func (h *NotificationHandler) BroadcastNotification(w http.ResponseWriter, r *http.Request) {
+func (h *NotificationHandler) AdminBroadcastNotification(w http.ResponseWriter, r *http.Request) {
 	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
@@ -548,18 +570,154 @@ func (h *NotificationHandler) BroadcastNotification(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// Create notification record
+	notification := &entities.Notification{
+		ID:         uuid.New().String(),
+		UserID:     req.UserID,
+		FromUserID: "system",
+		Type:       "admin",
+		Message:    req.Message,
+		Data:       req.Data,
+		Read:       false,
+		CreatedAt:  time.Now(),
+	}
+
+	if err := h.notificationService.Create(r.Context(), notification); err != nil {
+		h.handleServiceError(w, err, "Failed to create notification")
+		return
+	}
+
 	// Send via WebSocket
 	if h.wsHub != nil {
-		h.wsHub.SendNotification(req.UserID, map[string]interface{}{
-			"type":    "admin_broadcast",
-			"message": req.Message,
-			"data":    req.Data,
-		})
+		h.wsHub.SendNotification(req.UserID, notification)
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Broadcast sent",
+		"message": "Notification broadcast sent",
+	})
+}
+
+// ======================================================================
+= Admin Get Notification Analytics
+// ======================================================================
+
+// AdminGetNotificationAnalytics handles retrieving notification analytics.
+// @Summary Admin get notification analytics
+// @Description Retrieves notification analytics for moderation insights (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.NotificationAnalyticsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/notifications/analytics [get]
+func (h *NotificationHandler) AdminGetNotificationAnalytics(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	analytics, err := h.notificationService.AdminGetNotificationAnalytics(r.Context(), days)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get notification analytics")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, analytics)
+}
+
+// ======================================================================
+= Admin Manage Notification Templates
+// ======================================================================
+
+// AdminListNotificationTemplates handles listing notification templates.
+// @Summary Admin list notification templates
+// @Description Lists all notification templates (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.NotificationTemplateListResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/notifications/templates [get]
+func (h *NotificationHandler) AdminListNotificationTemplates(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	templates, err := h.notificationService.AdminListNotificationTemplates(r.Context())
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to list notification templates")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, templates)
+}
+
+// AdminUpdateNotificationTemplate handles updating a notification template.
+// @Summary Admin update notification template
+// @Description Updates a notification template (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Accept json
+// @Produce json
+// @Param id path string true "Template ID"
+// @Param request body dto.UpdateNotificationTemplateRequest true "Template details"
+// @Success 200 {object} dto.SuccessResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/notifications/templates/{id} [put]
+func (h *NotificationHandler) AdminUpdateNotificationTemplate(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	vars := mux.Vars(r)
+	templateID := vars["id"]
+	if templateID == "" {
+		h.sendError(w, http.StatusBadRequest, "Template ID required", nil)
+		return
+	}
+
+	var req dto.UpdateNotificationTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, http.StatusBadRequest, "Invalid request body", nil)
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		h.sendValidationError(w, err)
+		return
+	}
+
+	if err := h.notificationService.AdminUpdateNotificationTemplate(r.Context(), templateID, &req); err != nil {
+		h.handleServiceError(w, err, "Failed to update notification template")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Notification template updated successfully",
 	})
 }
 
@@ -611,6 +769,8 @@ func (h *NotificationHandler) handleServiceError(w http.ResponseWriter, err erro
 		h.sendError(w, http.StatusForbidden, "Notification does not belong to user", nil)
 	case errors.Is(err, service.ErrInvalidNotificationType):
 		h.sendError(w, http.StatusBadRequest, "Invalid notification type", nil)
+	case errors.Is(err, service.ErrNotificationLimitExceeded):
+		h.sendError(w, http.StatusBadRequest, "Notification limit exceeded", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
