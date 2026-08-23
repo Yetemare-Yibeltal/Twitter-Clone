@@ -5,19 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 
-	"twitter-clone/backend/internal/adapter"
 	"twitter-clone/backend/internal/config"
-	"twitter-clone/backend/internal/domain/entities"
 	"twitter-clone/backend/internal/dto"
 	"twitter-clone/backend/internal/middleware"
 	"twitter-clone/backend/internal/repository/interfaces"
@@ -47,16 +44,25 @@ const (
 	MsgTypeLike          = "like"
 	MsgTypeRetweet       = "retweet"
 	MsgTypeFollow        = "follow"
+	MsgTypeUnfollow      = "unfollow"
+	MsgTypeBlock         = "block"
+	MsgTypeUnblock       = "unblock"
+	MsgTypeMute          = "mute"
+	MsgTypeUnmute        = "unmute"
 	MsgTypeError         = "error"
 	MsgTypeAck           = "ack"
 	MsgTypeConversation  = "conversation"
 	MsgTypeUserStatus    = "user_status"
 	MsgTypeOnline        = "online"
 	MsgTypeOffline       = "offline"
+	MsgTypeSpaceJoin     = "space_join"
+	MsgTypeSpaceLeave    = "space_leave"
+	MsgTypeSpaceAudio    = "space_audio"
+	MsgTypeSpaceMute     = "space_mute"
 )
 
 // ======================================================================
-= WebSocket Hub
+// WebSocket Hub
 // ======================================================================
 
 // Client represents a WebSocket connection.
@@ -69,6 +75,8 @@ type Client struct {
 	Rooms      map[string]bool
 	CreatedAt  time.Time
 	LastPing   time.Time
+	UserAgent  string
+	IP         string
 	mu         sync.RWMutex
 }
 
@@ -320,6 +328,14 @@ func (h *Hub) GetOnlineUsers() []string {
 	return users
 }
 
+// IsUserOnline checks if a user is online.
+func (h *Hub) IsUserOnline(userID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, exists := h.Clients[userID]
+	return exists
+}
+
 // ======================================================================
 = WebSocket Handler
 // ======================================================================
@@ -329,7 +345,6 @@ type WebSocketHandler struct {
 	hub          *Hub
 	upgrader     websocket.Upgrader
 	userRepo     interfaces.UserRepository
-	redisAdapter adapter.RedisAdapter
 	config       *config.Config
 	log          *logrus.Entry
 }
@@ -338,7 +353,6 @@ type WebSocketHandler struct {
 func NewWebSocketHandler(
 	hub *Hub,
 	userRepo interfaces.UserRepository,
-	redisAdapter adapter.RedisAdapter,
 	cfg *config.Config,
 ) *WebSocketHandler {
 	return &WebSocketHandler{
@@ -360,10 +374,9 @@ func NewWebSocketHandler(
 				return true
 			},
 		},
-		userRepo:     userRepo,
-		redisAdapter: redisAdapter,
-		config:       cfg,
-		log:          logger.WithField("handler", "websocket"),
+		userRepo: userRepo,
+		config:   cfg,
+		log:      logger.WithField("handler", "websocket"),
 	}
 }
 
@@ -372,6 +385,14 @@ func NewWebSocketHandler(
 // ======================================================================
 
 // ServeWS handles WebSocket upgrade requests.
+// @Summary WebSocket connection
+// @Description Establishes a WebSocket connection for real-time features
+// @Tags websocket
+// @Security BearerAuth
+// @Success 101 "Switching Protocols"
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /ws [get]
 func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// Extract user ID from context (set by auth middleware)
 	userID, err := middleware.GetUserID(r.Context())
@@ -398,7 +419,7 @@ func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	
 	// Create client
 	client := &Client{
-		ID:        uuid.New().String(),
+		ID:        generateClientID(),
 		UserID:    userID,
 		Conn:      conn,
 		Hub:       h.hub,
@@ -406,6 +427,8 @@ func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		Rooms:     make(map[string]bool),
 		CreatedAt: time.Now(),
 		LastPing:  time.Now(),
+		UserAgent: r.UserAgent(),
+		IP:        r.RemoteAddr,
 	}
 	
 	// Add user to their personal room
@@ -427,13 +450,16 @@ func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// Send online status to all clients
 	h.broadcastUserStatus(userID, true)
 	
+	// Send current online users to the new client
+	h.sendOnlineUsers(client)
+	
 	// Start goroutines
 	go h.writePump(client)
 	go h.readPump(client)
 	
 	h.log.WithFields(logrus.Fields{
-		"user_id":  userID,
-		"username": user.Username,
+		"user_id":   userID,
+		"username":  user.Username,
 		"client_id": client.ID,
 	}).Info("WebSocket connection established")
 }
@@ -548,6 +574,15 @@ func (h *WebSocketHandler) handleMessage(client *Client, data []byte) {
 	case MsgTypeNewMessage:
 		h.handleNewMessage(client, msg)
 		
+	case MsgTypeSpaceJoin:
+		h.handleSpaceJoin(client, msg)
+		
+	case MsgTypeSpaceLeave:
+		h.handleSpaceLeave(client, msg)
+		
+	case MsgTypeSpaceAudio:
+		h.handleSpaceAudio(client, msg)
+		
 	default:
 		h.sendError(client, "Unknown message type: "+msgType)
 	}
@@ -564,7 +599,7 @@ func (h *WebSocketHandler) handlePing(client *Client) {
 	client.mu.Unlock()
 	
 	response := map[string]interface{}{
-		"type": MsgTypePong,
+		"type":      MsgTypePong,
 		"timestamp": time.Now().Unix(),
 	}
 	h.sendToClient(client, response)
@@ -578,10 +613,10 @@ func (h *WebSocketHandler) handleTyping(client *Client, msg map[string]interface
 	}
 	
 	response := map[string]interface{}{
-		"type":       MsgTypeTyping,
-		"sender_id":  client.UserID,
+		"type":        MsgTypeTyping,
+		"sender_id":   client.UserID,
 		"receiver_id": receiverID,
-		"timestamp":  time.Now().Unix(),
+		"timestamp":   time.Now().Unix(),
 	}
 	data, _ := json.Marshal(response)
 	h.hub.sendToUser(receiverID, data)
@@ -595,10 +630,10 @@ func (h *WebSocketHandler) handleStopTyping(client *Client, msg map[string]inter
 	}
 	
 	response := map[string]interface{}{
-		"type":       MsgTypeStopTyping,
-		"sender_id":  client.UserID,
+		"type":        MsgTypeStopTyping,
+		"sender_id":   client.UserID,
 		"receiver_id": receiverID,
-		"timestamp":  time.Now().Unix(),
+		"timestamp":   time.Now().Unix(),
 	}
 	data, _ := json.Marshal(response)
 	h.hub.sendToUser(receiverID, data)
@@ -640,6 +675,66 @@ func (h *WebSocketHandler) handleNewMessage(client *Client, msg map[string]inter
 	h.sendToClient(client, response)
 }
 
+// handleSpaceJoin handles joining a space room.
+func (h *WebSocketHandler) handleSpaceJoin(client *Client, msg map[string]interface{}) {
+	spaceID, ok := msg["space_id"].(string)
+	if !ok || spaceID == "" {
+		return
+	}
+	
+	roomID := "space:" + spaceID
+	client.Rooms[roomID] = true
+	
+	response := map[string]interface{}{
+		"type":      MsgTypeSpaceJoin,
+		"space_id":  spaceID,
+		"user_id":   client.UserID,
+		"timestamp": time.Now().Unix(),
+	}
+	data, _ := json.Marshal(response)
+	h.hub.sendToRoom(roomID, data)
+}
+
+// handleSpaceLeave handles leaving a space room.
+func (h *WebSocketHandler) handleSpaceLeave(client *Client, msg map[string]interface{}) {
+	spaceID, ok := msg["space_id"].(string)
+	if !ok || spaceID == "" {
+		return
+	}
+	
+	roomID := "space:" + spaceID
+	delete(client.Rooms, roomID)
+	
+	response := map[string]interface{}{
+		"type":      MsgTypeSpaceLeave,
+		"space_id":  spaceID,
+		"user_id":   client.UserID,
+		"timestamp": time.Now().Unix(),
+	}
+	data, _ := json.Marshal(response)
+	h.hub.sendToRoom(roomID, data)
+}
+
+// handleSpaceAudio handles audio data in a space.
+func (h *WebSocketHandler) handleSpaceAudio(client *Client, msg map[string]interface{}) {
+	spaceID, ok := msg["space_id"].(string)
+	if !ok || spaceID == "" {
+		return
+	}
+	
+	// Forward audio data to other participants
+	roomID := "space:" + spaceID
+	response := map[string]interface{}{
+		"type":      MsgTypeSpaceAudio,
+		"space_id":  spaceID,
+		"user_id":   client.UserID,
+		"data":      msg["data"],
+		"timestamp": time.Now().Unix(),
+	}
+	data, _ := json.Marshal(response)
+	h.hub.sendToRoom(roomID, data)
+}
+
 // ======================================================================
 = Send Helpers
 // ======================================================================
@@ -661,9 +756,21 @@ func (h *WebSocketHandler) sendToClient(client *Client, data interface{}) {
 // sendError sends an error message to a client.
 func (h *WebSocketHandler) sendError(client *Client, message string) {
 	response := map[string]interface{}{
-		"type":    MsgTypeError,
-		"error":   message,
+		"type":      MsgTypeError,
+		"error":     message,
 		"timestamp": time.Now().Unix(),
+	}
+	h.sendToClient(client, response)
+}
+
+// sendOnlineUsers sends the list of online users to a new client.
+func (h *WebSocketHandler) sendOnlineUsers(client *Client) {
+	onlineUsers := h.hub.GetOnlineUsers()
+	response := map[string]interface{}{
+		"type":         "online_users",
+		"online_users": onlineUsers,
+		"count":        len(onlineUsers),
+		"timestamp":    time.Now().Unix(),
 	}
 	h.sendToClient(client, response)
 }
@@ -742,8 +849,8 @@ func (h *WebSocketHandler) SendNotification(userID string, notification *entitie
 // SendNewTweet sends a new tweet notification.
 func (h *WebSocketHandler) SendNewTweet(userID string, tweet *dto.TweetResponse) {
 	data := map[string]interface{}{
-		"type":    MsgTypeNewTweet,
-		"tweet":   tweet,
+		"type":      MsgTypeNewTweet,
+		"tweet":     tweet,
 		"timestamp": time.Now().Unix(),
 	}
 	h.BroadcastToUser(userID, data)
@@ -752,9 +859,9 @@ func (h *WebSocketHandler) SendNewTweet(userID string, tweet *dto.TweetResponse)
 // SendLike sends a like notification.
 func (h *WebSocketHandler) SendLike(userID string, tweetID string, liked bool) {
 	data := map[string]interface{}{
-		"type":     MsgTypeLike,
-		"tweet_id": tweetID,
-		"liked":    liked,
+		"type":      MsgTypeLike,
+		"tweet_id":  tweetID,
+		"liked":     liked,
 		"timestamp": time.Now().Unix(),
 	}
 	h.BroadcastToUser(userID, data)
@@ -774,9 +881,64 @@ func (h *WebSocketHandler) SendRetweet(userID string, tweetID string, retweeted 
 // SendFollow sends a follow notification.
 func (h *WebSocketHandler) SendFollow(userID string, followerID string, followed bool) {
 	data := map[string]interface{}{
-		"type":       MsgTypeFollow,
+		"type":        MsgTypeFollow,
 		"follower_id": followerID,
-		"followed":   followed,
+		"followed":    followed,
+		"timestamp":   time.Now().Unix(),
+	}
+	h.BroadcastToUser(userID, data)
+}
+
+// SendUnfollow sends an unfollow notification.
+func (h *WebSocketHandler) SendUnfollow(userID string, followerID string, unfollowed bool) {
+	data := map[string]interface{}{
+		"type":        MsgTypeUnfollow,
+		"follower_id": followerID,
+		"unfollowed":  unfollowed,
+		"timestamp":   time.Now().Unix(),
+	}
+	h.BroadcastToUser(userID, data)
+}
+
+// SendBlock sends a block notification.
+func (h *WebSocketHandler) SendBlock(userID string, blockedID string, blocked bool) {
+	data := map[string]interface{}{
+		"type":       MsgTypeBlock,
+		"blocked_id": blockedID,
+		"blocked":    blocked,
+		"timestamp":  time.Now().Unix(),
+	}
+	h.BroadcastToUser(userID, data)
+}
+
+// SendUnblock sends an unblock notification.
+func (h *WebSocketHandler) SendUnblock(userID string, unblockedID string, unblocked bool) {
+	data := map[string]interface{}{
+		"type":         MsgTypeUnblock,
+		"unblocked_id": unblockedID,
+		"unblocked":    unblocked,
+		"timestamp":    time.Now().Unix(),
+	}
+	h.BroadcastToUser(userID, data)
+}
+
+// SendMute sends a mute notification.
+func (h *WebSocketHandler) SendMute(userID string, mutedID string, muted bool) {
+	data := map[string]interface{}{
+		"type":     MsgTypeMute,
+		"muted_id": mutedID,
+		"muted":    muted,
+		"timestamp": time.Now().Unix(),
+	}
+	h.BroadcastToUser(userID, data)
+}
+
+// SendUnmute sends an unmute notification.
+func (h *WebSocketHandler) SendUnmute(userID string, unmutedID string, unmuted bool) {
+	data := map[string]interface{}{
+		"type":       MsgTypeUnmute,
+		"unmuted_id": unmutedID,
+		"unmuted":    unmuted,
 		"timestamp":  time.Now().Unix(),
 	}
 	h.BroadcastToUser(userID, data)
@@ -796,7 +958,19 @@ func (h *WebSocketHandler) GetOnlineCount() int {
 	return h.hub.GetClientCount()
 }
 
+// IsUserOnline checks if a user is online.
+func (h *WebSocketHandler) IsUserOnline(userID string) bool {
+	return h.hub.IsUserOnline(userID)
+}
+
 // HealthCheck checks the health of the WebSocket handler.
+// @Summary WebSocket health check
+// @Description Checks the health status of the WebSocket handler
+// @Tags websocket
+// @Produce json
+// @Success 200 {object} dto.HealthResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /ws/health [get]
 func (h *WebSocketHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
 		"component":    "websocket_handler",
@@ -818,4 +992,13 @@ func (h *WebSocketHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 func (h *WebSocketHandler) Close() {
 	h.hub.Stop()
 	h.log.Info("WebSocket handler closed")
+}
+
+// ======================================================================
+= Helper Functions
+// ======================================================================
+
+// generateClientID generates a unique client ID.
+func generateClientID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
