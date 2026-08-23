@@ -39,7 +39,7 @@ func NewBookmarkHandler(
 }
 
 // ======================================================================
-// Bookmark/Unbookmark
+// Add Bookmark
 // ======================================================================
 
 // AddBookmark handles bookmarking a tweet.
@@ -69,6 +69,17 @@ func (h *BookmarkHandler) AddBookmark(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify tweet exists
+	tweet, err := h.tweetService.GetTweetByID(r.Context(), tweetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Tweet not found")
+		return
+	}
+	if tweet.DeletedAt != nil {
+		h.sendError(w, http.StatusNotFound, "Tweet has been deleted", nil)
+		return
+	}
+
 	result, err := h.bookmarkService.AddBookmark(r.Context(), userID, tweetID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to add bookmark")
@@ -77,6 +88,10 @@ func (h *BookmarkHandler) AddBookmark(w http.ResponseWriter, r *http.Request) {
 
 	h.sendSuccess(w, http.StatusCreated, result)
 }
+
+// ======================================================================
+= Remove Bookmark
+// ======================================================================
 
 // RemoveBookmark handles unbookmarking a tweet.
 // @Summary Unbookmark a tweet
@@ -104,6 +119,17 @@ func (h *BookmarkHandler) RemoveBookmark(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check if bookmarked first
+	isBookmarked, err := h.bookmarkService.IsBookmarked(r.Context(), userID, tweetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to check bookmark status")
+		return
+	}
+	if !isBookmarked {
+		h.sendError(w, http.StatusNotFound, "Bookmark not found", nil)
+		return
+	}
+
 	result, err := h.bookmarkService.RemoveBookmark(r.Context(), userID, tweetID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to remove bookmark")
@@ -112,6 +138,10 @@ func (h *BookmarkHandler) RemoveBookmark(w http.ResponseWriter, r *http.Request)
 
 	h.sendSuccess(w, http.StatusOK, result)
 }
+
+// ======================================================================
+= Toggle Bookmark
+// ======================================================================
 
 // ToggleBookmark handles toggling a bookmark on a tweet.
 // @Summary Toggle bookmark
@@ -136,6 +166,13 @@ func (h *BookmarkHandler) ToggleBookmark(w http.ResponseWriter, r *http.Request)
 	tweetID := vars["id"]
 	if tweetID == "" {
 		h.sendError(w, http.StatusBadRequest, "Tweet ID required", nil)
+		return
+	}
+
+	// Verify tweet exists
+	_, err = h.tweetService.GetTweetByID(r.Context(), tweetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Tweet not found")
 		return
 	}
 
@@ -227,8 +264,30 @@ func (h *BookmarkHandler) GetBookmarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If includeTweetDetails is true, fetch tweet details for each bookmark
+	var enhancedBookmarks []interface{}
+	if includeTweetDetails {
+		for _, b := range bookmarks {
+			tweet, err := h.tweetService.GetTweetByID(r.Context(), b.TweetID)
+			if err != nil {
+				h.log.WithError(err).WithField("tweet_id", b.TweetID).Warn("Failed to get tweet details")
+				enhancedBookmarks = append(enhancedBookmarks, b)
+				continue
+			}
+			enhancedBookmarks = append(enhancedBookmarks, map[string]interface{}{
+				"bookmark": b,
+				"tweet":    tweet,
+			})
+		}
+	} else {
+		enhancedBookmarks = make([]interface{}, len(bookmarks))
+		for i, b := range bookmarks {
+			enhancedBookmarks[i] = b
+		}
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        bookmarks,
+		"data":        enhancedBookmarks,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -300,7 +359,7 @@ func (h *BookmarkHandler) GetBookmarkCount(w http.ResponseWriter, r *http.Reques
 }
 
 // ======================================================================
-= Get Bookmarks by Tweet IDs (Bulk)
+= Bulk Status Check
 // ======================================================================
 
 // GetBookmarksByTweetIDs handles retrieving bookmark statuses for multiple tweets.
@@ -365,7 +424,6 @@ func (h *BookmarkHandler) GetBookmarksByTweetIDs(w http.ResponseWriter, r *http.
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/admin/bookmarks [get]
 func (h *BookmarkHandler) AdminListBookmarks(w http.ResponseWriter, r *http.Request) {
-	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
 		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
@@ -408,7 +466,6 @@ func (h *BookmarkHandler) AdminListBookmarks(w http.ResponseWriter, r *http.Requ
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/admin/bookmarks/{id} [delete]
 func (h *BookmarkHandler) AdminDeleteBookmark(w http.ResponseWriter, r *http.Request) {
-	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
 		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
@@ -429,7 +486,7 @@ func (h *BookmarkHandler) AdminDeleteBookmark(w http.ResponseWriter, r *http.Req
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Bookmark deleted successfully",
+		"message": "Bookmark deleted",
 	})
 }
 
@@ -445,7 +502,6 @@ func (h *BookmarkHandler) AdminDeleteBookmark(w http.ResponseWriter, r *http.Req
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/admin/bookmarks/stats [get]
 func (h *BookmarkHandler) AdminGetBookmarkStats(w http.ResponseWriter, r *http.Request) {
-	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
 		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
@@ -504,15 +560,13 @@ func (h *BookmarkHandler) handleServiceError(w http.ResponseWriter, err error, d
 	case errors.Is(err, service.ErrBookmarkNotFound):
 		h.sendError(w, http.StatusNotFound, "Bookmark not found", nil)
 	case errors.Is(err, service.ErrAlreadyBookmarked):
-		h.sendError(w, http.StatusConflict, "Tweet already bookmarked", nil)
+		h.sendError(w, http.StatusConflict, "Already bookmarked", nil)
 	case errors.Is(err, service.ErrTweetNotFound):
 		h.sendError(w, http.StatusNotFound, "Tweet not found", nil)
 	case errors.Is(err, service.ErrInvalidBookmarkID):
 		h.sendError(w, http.StatusBadRequest, "Invalid bookmark ID", nil)
 	case errors.Is(err, service.ErrBookmarkDisabled):
-		h.sendError(w, http.StatusBadRequest, "Bookmarking is disabled for this tweet", nil)
-	case errors.Is(err, service.ErrBookmarkNotFoundByUser):
-		h.sendError(w, http.StatusNotFound, "Bookmark not found for this user", nil)
+		h.sendError(w, http.StatusBadRequest, "Bookmarking disabled", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
