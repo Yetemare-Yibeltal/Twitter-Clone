@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -76,7 +77,7 @@ func (r *sessionRepo) getDB() sqlx.ExtContext {
 }
 
 // ======================================================================
-// Basic Session Operations
+// Basic CRUD
 // ======================================================================
 
 // Create inserts a new session.
@@ -98,7 +99,6 @@ func (r *sessionRepo) Create(ctx context.Context, session *entities.Session) err
 	)
 	if err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
-			// Check if it's a duplicate refresh token
 			if pgErr.Constraint == "sessions_refresh_token_key" {
 				return interfaces.ErrDuplicateRefreshToken
 			}
@@ -136,7 +136,22 @@ func (r *sessionRepo) GetByRefreshToken(ctx context.Context, refreshToken string
 	return &session, nil
 }
 
-// Update updates a session (e.g., refresh token rotation, expiry extension).
+// GetByUserID retrieves all sessions for a user.
+func (r *sessionRepo) GetByUserID(ctx context.Context, userID string) ([]*entities.Session, error) {
+	query := `
+		SELECT * FROM sessions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get sessions by user failed: %w", err)
+	}
+	return sessions, nil
+}
+
+// Update updates a session (e.g., refresh token rotation).
 func (r *sessionRepo) Update(ctx context.Context, session *entities.Session) error {
 	metadataJSON, err := json.Marshal(session.Metadata)
 	if err != nil {
@@ -163,6 +178,31 @@ func (r *sessionRepo) Update(ctx context.Context, session *entities.Session) err
 			}
 		}
 		return fmt.Errorf("update session failed: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return interfaces.ErrSessionNotFound
+	}
+	return nil
+}
+
+// UpdateRefreshToken updates the refresh token for a session.
+func (r *sessionRepo) UpdateRefreshToken(ctx context.Context, id, newRefreshToken string, newExpiry time.Time) error {
+	query := `
+		UPDATE sessions SET
+			refresh_token = $1,
+			expires_at = $2,
+			updated_at = $3
+		WHERE id = $4
+	`
+	result, err := r.getDB().ExecContext(ctx, query, newRefreshToken, newExpiry, time.Now(), id)
+	if err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			if pgErr.Constraint == "sessions_refresh_token_key" {
+				return interfaces.ErrDuplicateRefreshToken
+			}
+		}
+		return fmt.Errorf("update refresh token failed: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
@@ -199,27 +239,80 @@ func (r *sessionRepo) DeleteByRefreshToken(ctx context.Context, refreshToken str
 	return nil
 }
 
-// ======================================================================
-// User Session Queries
-// ======================================================================
-
-// GetByUserID returns all active sessions for a user.
-func (r *sessionRepo) GetByUserID(ctx context.Context, userID string) ([]*entities.Session, error) {
-	query := `
-		SELECT * FROM sessions
-		WHERE user_id = $1 AND expires_at > NOW()
-		ORDER BY created_at DESC
-	`
-	var sessions []*entities.Session
-	err := r.getDB().SelectContext(ctx, &sessions, query, userID)
+// DeleteByUserID removes all sessions for a user.
+func (r *sessionRepo) DeleteByUserID(ctx context.Context, userID string) error {
+	query := `DELETE FROM sessions WHERE user_id = $1`
+	_, err := r.getDB().ExecContext(ctx, query, userID)
 	if err != nil {
-		return nil, fmt.Errorf("get sessions by user failed: %w", err)
+		return fmt.Errorf("delete sessions by user failed: %w", err)
 	}
-	return sessions, nil
+	return nil
 }
 
-// GetActiveByUserID returns active sessions for a user with pagination.
-func (r *sessionRepo) GetActiveByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Session, string, error) {
+// ======================================================================
+// Existence Checks
+// ======================================================================
+
+// Exists checks if a session exists.
+func (r *sessionRepo) Exists(ctx context.Context, id string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1)`
+	var exists bool
+	err := r.getDB().GetContext(ctx, &exists, query, id)
+	if err != nil {
+		return false, fmt.Errorf("check session existence failed: %w", err)
+	}
+	return exists, nil
+}
+
+// ExistsByRefreshToken checks if a refresh token exists.
+func (r *sessionRepo) ExistsByRefreshToken(ctx context.Context, refreshToken string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM sessions WHERE refresh_token = $1)`
+	var exists bool
+	err := r.getDB().GetContext(ctx, &exists, query, refreshToken)
+	if err != nil {
+		return false, fmt.Errorf("check refresh token existence failed: %w", err)
+	}
+	return exists, nil
+}
+
+// IsValidSession checks if a session is valid (exists and not expired).
+func (r *sessionRepo) IsValidSession(ctx context.Context, id string) (bool, error) {
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM sessions
+			WHERE id = $1 AND expires_at > NOW()
+		)
+	`
+	var valid bool
+	err := r.getDB().GetContext(ctx, &valid, query, id)
+	if err != nil {
+		return false, fmt.Errorf("check session validity failed: %w", err)
+	}
+	return valid, nil
+}
+
+// IsValidRefreshToken checks if a refresh token is valid.
+func (r *sessionRepo) IsValidRefreshToken(ctx context.Context, refreshToken string) (bool, error) {
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM sessions
+			WHERE refresh_token = $1 AND expires_at > NOW()
+		)
+	`
+	var valid bool
+	err := r.getDB().GetContext(ctx, &valid, query, refreshToken)
+	if err != nil {
+		return false, fmt.Errorf("check refresh token validity failed: %w", err)
+	}
+	return valid, nil
+}
+
+// ======================================================================
+// Active/Expired Sessions
+// ======================================================================
+
+// GetActiveSessions returns active sessions for a user.
+func (r *sessionRepo) GetActiveSessions(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Session, string, error) {
 	if limit < 1 {
 		limit = 20
 	}
@@ -233,10 +326,10 @@ func (r *sessionRepo) GetActiveByUserID(ctx context.Context, userID string, curs
 	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
 
 	args := []interface{}{userID}
-	argIndex := 2
+	argIdx := 2
 	if cursor != "" {
 		args = append(args, cursor)
-		argIndex = 3
+		argIdx = 3
 	}
 	args = append(args, limit)
 	query = r.getDB().Rebind(query)
@@ -244,9 +337,8 @@ func (r *sessionRepo) GetActiveByUserID(ctx context.Context, userID string, curs
 	var sessions []*entities.Session
 	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
 	if err != nil {
-		return nil, "", fmt.Errorf("get active sessions by user failed: %w", err)
+		return nil, "", fmt.Errorf("get active sessions failed: %w", err)
 	}
-
 	var nextCursor string
 	if len(sessions) == limit {
 		nextCursor = sessions[len(sessions)-1].ID
@@ -254,45 +346,197 @@ func (r *sessionRepo) GetActiveByUserID(ctx context.Context, userID string, curs
 	return sessions, nextCursor, nil
 }
 
-// GetExpiredByUserID returns expired sessions for a user.
-func (r *sessionRepo) GetExpiredByUserID(ctx context.Context, userID string) ([]*entities.Session, error) {
+// GetExpiredSessions returns expired sessions for a user.
+func (r *sessionRepo) GetExpiredSessions(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
 	query := `
 		SELECT * FROM sessions
 		WHERE user_id = $1 AND expires_at <= NOW()
-		ORDER BY expires_at DESC
 	`
-	var sessions []*entities.Session
-	err := r.getDB().SelectContext(ctx, &sessions, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("get expired sessions by user failed: %w", err)
+	if cursor != "" {
+		query += ` AND id > $2`
 	}
-	return sessions, nil
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID}
+	argIdx := 2
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 3
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get expired sessions failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
 }
 
-// GetLatestByUserID returns the most recent session for a user.
-func (r *sessionRepo) GetLatestByUserID(ctx context.Context, userID string) (*entities.Session, error) {
+// GetActiveSessionsAll returns all active sessions globally (for admin).
+func (r *sessionRepo) GetActiveSessionsAll(ctx context.Context, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
 	query := `
 		SELECT * FROM sessions
-		WHERE user_id = $1
-		ORDER BY created_at DESC
-		LIMIT 1
+		WHERE expires_at > NOW()
 	`
-	var session entities.Session
-	err := r.getDB().GetContext(ctx, &session, query, userID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get latest session by user failed: %w", err)
+	if cursor != "" {
+		query += ` AND id > $1`
 	}
-	return &session, nil
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{}
+	argIdx := 1
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 2
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get active sessions all failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetExpiredSessionsAll returns all expired sessions globally.
+func (r *sessionRepo) GetExpiredSessionsAll(ctx context.Context, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE expires_at <= NOW()
+	`
+	if cursor != "" {
+		query += ` AND id > $1`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{}
+	argIdx := 1
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 2
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get expired sessions all failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetSessionsByIP returns sessions from a specific IP.
+func (r *sessionRepo) GetSessionsByIP(ctx context.Context, ip string, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE ip = $1
+	`
+	if cursor != "" {
+		query += ` AND id > $2`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{ip}
+	argIdx := 2
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 3
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions by IP failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetSessionsByUserAgent returns sessions with a specific user agent.
+func (r *sessionRepo) GetSessionsByUserAgent(ctx context.Context, userAgent string, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE user_agent = $1
+	`
+	if cursor != "" {
+		query += ` AND id > $2`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userAgent}
+	argIdx := 2
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 3
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions by user agent failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
 }
 
 // ======================================================================
-= Count Operations
+// Count Operations
 // ======================================================================
 
-// CountActiveByUserID returns the number of active sessions for a user.
+// CountByUserID returns total sessions for a user.
+func (r *sessionRepo) CountByUserID(ctx context.Context, userID string) (int64, error) {
+	query := `SELECT COUNT(*) FROM sessions WHERE user_id = $1`
+	var count int64
+	err := r.getDB().GetContext(ctx, &count, query, userID)
+	if err != nil {
+		return 0, fmt.Errorf("count sessions by user failed: %w", err)
+	}
+	return count, nil
+}
+
+// CountActiveByUserID returns active sessions count for a user.
 func (r *sessionRepo) CountActiveByUserID(ctx context.Context, userID string) (int64, error) {
 	query := `SELECT COUNT(*) FROM sessions WHERE user_id = $1 AND expires_at > NOW()`
 	var count int64
@@ -303,18 +547,18 @@ func (r *sessionRepo) CountActiveByUserID(ctx context.Context, userID string) (i
 	return count, nil
 }
 
-// CountTotalByUserID returns the total number of sessions for a user.
-func (r *sessionRepo) CountTotalByUserID(ctx context.Context, userID string) (int64, error) {
-	query := `SELECT COUNT(*) FROM sessions WHERE user_id = $1`
+// CountExpiredByUserID returns expired sessions count for a user.
+func (r *sessionRepo) CountExpiredByUserID(ctx context.Context, userID string) (int64, error) {
+	query := `SELECT COUNT(*) FROM sessions WHERE user_id = $1 AND expires_at <= NOW()`
 	var count int64
 	err := r.getDB().GetContext(ctx, &count, query, userID)
 	if err != nil {
-		return 0, fmt.Errorf("count total sessions by user failed: %w", err)
+		return 0, fmt.Errorf("count expired sessions by user failed: %w", err)
 	}
 	return count, nil
 }
 
-// CountTotal returns the total number of sessions in the system.
+// CountTotal returns total sessions in the system.
 func (r *sessionRepo) CountTotal(ctx context.Context) (int64, error) {
 	query := `SELECT COUNT(*) FROM sessions`
 	var count int64
@@ -325,7 +569,7 @@ func (r *sessionRepo) CountTotal(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
-// CountActive returns the number of active sessions in the system.
+// CountActive returns total active sessions in the system.
 func (r *sessionRepo) CountActive(ctx context.Context) (int64, error) {
 	query := `SELECT COUNT(*) FROM sessions WHERE expires_at > NOW()`
 	var count int64
@@ -336,7 +580,7 @@ func (r *sessionRepo) CountActive(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
-// CountExpired returns the number of expired sessions in the system.
+// CountExpired returns total expired sessions in the system.
 func (r *sessionRepo) CountExpired(ctx context.Context) (int64, error) {
 	query := `SELECT COUNT(*) FROM sessions WHERE expires_at <= NOW()`
 	var count int64
@@ -347,8 +591,102 @@ func (r *sessionRepo) CountExpired(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// CountByDateRange returns session count within a date range.
+func (r *sessionRepo) CountByDateRange(ctx context.Context, start, end time.Time) (int64, error) {
+	query := `SELECT COUNT(*) FROM sessions WHERE created_at >= $1 AND created_at <= $2`
+	var count int64
+	err := r.getDB().GetContext(ctx, &count, query, start, end)
+	if err != nil {
+		return 0, fmt.Errorf("count sessions by date range failed: %w", err)
+	}
+	return count, nil
+}
+
+// CountByDateRangeForUser returns session count for a user within a date range.
+func (r *sessionRepo) CountByDateRangeForUser(ctx context.Context, userID string, start, end time.Time) (int64, error) {
+	query := `SELECT COUNT(*) FROM sessions WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3`
+	var count int64
+	err := r.getDB().GetContext(ctx, &count, query, userID, start, end)
+	if err != nil {
+		return 0, fmt.Errorf("count sessions by date range for user failed: %w", err)
+	}
+	return count, nil
+}
+
+// CountUniqueUsersInDateRange returns unique users with sessions in a date range.
+func (r *sessionRepo) CountUniqueUsersInDateRange(ctx context.Context, start, end time.Time) (int64, error) {
+	query := `SELECT COUNT(DISTINCT user_id) FROM sessions WHERE created_at >= $1 AND created_at <= $2`
+	var count int64
+	err := r.getDB().GetContext(ctx, &count, query, start, end)
+	if err != nil {
+		return 0, fmt.Errorf("count unique users in date range failed: %w", err)
+	}
+	return count, nil
+}
+
 // ======================================================================
-= Expiry and Cleanup
+// Expiry Management
+// ======================================================================
+
+// ExtendExpiry extends the expiry of a session.
+func (r *sessionRepo) ExtendExpiry(ctx context.Context, id string, newExpiry time.Time) error {
+	query := `UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE id = $3`
+	result, err := r.getDB().ExecContext(ctx, query, newExpiry, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("extend expiry failed: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return interfaces.ErrSessionNotFound
+	}
+	return nil
+}
+
+// Revoke revokes a session (sets it as inactive/expired).
+func (r *sessionRepo) Revoke(ctx context.Context, id string) error {
+	query := `UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE id = $3`
+	_, err := r.getDB().ExecContext(ctx, query, time.Now(), time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("revoke session failed: %w", err)
+	}
+	return nil
+}
+
+// RevokeAll revokes all sessions for a user.
+func (r *sessionRepo) RevokeAll(ctx context.Context, userID string) error {
+	query := `UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE user_id = $3 AND expires_at > NOW()`
+	_, err := r.getDB().ExecContext(ctx, query, time.Now(), time.Now(), userID)
+	if err != nil {
+		return fmt.Errorf("revoke all sessions failed: %w", err)
+	}
+	return nil
+}
+
+// RevokeAllExcept revokes all sessions for a user except the given one.
+func (r *sessionRepo) RevokeAllExcept(ctx context.Context, userID, excludeSessionID string) error {
+	query := `
+		UPDATE sessions SET expires_at = $1, updated_at = $2
+		WHERE user_id = $3 AND id != $4 AND expires_at > NOW()
+	`
+	_, err := r.getDB().ExecContext(ctx, query, time.Now(), time.Now(), userID, excludeSessionID)
+	if err != nil {
+		return fmt.Errorf("revoke all except failed: %w", err)
+	}
+	return nil
+}
+
+// RevokeByRefreshToken revokes a session by its refresh token.
+func (r *sessionRepo) RevokeByRefreshToken(ctx context.Context, refreshToken string) error {
+	query := `UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE refresh_token = $3`
+	_, err := r.getDB().ExecContext(ctx, query, time.Now(), time.Now(), refreshToken)
+	if err != nil {
+		return fmt.Errorf("revoke by refresh token failed: %w", err)
+	}
+	return nil
+}
+
+// ======================================================================
+// Cleanup Operations
 // ======================================================================
 
 // CleanupExpired removes all expired sessions.
@@ -378,28 +716,209 @@ func (r *sessionRepo) CleanupOlderThan(ctx context.Context, before time.Time) (i
 	query := `DELETE FROM sessions WHERE created_at < $1`
 	result, err := r.getDB().ExecContext(ctx, query, before)
 	if err != nil {
-		return 0, fmt.Errorf("cleanup sessions older than date failed: %w", err)
+		return 0, fmt.Errorf("cleanup older than failed: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	return rows, nil
 }
 
-// ExtendExpiry extends the expiry of a session.
-func (r *sessionRepo) ExtendExpiry(ctx context.Context, id string, newExpiry time.Time) error {
-	query := `UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE id = $3`
-	result, err := r.getDB().ExecContext(ctx, query, newExpiry, time.Now(), id)
+// CleanupOlderThanForUser removes sessions older than a date for a user.
+func (r *sessionRepo) CleanupOlderThanForUser(ctx context.Context, userID string, before time.Time) (int64, error) {
+	query := `DELETE FROM sessions WHERE user_id = $1 AND created_at < $2`
+	result, err := r.getDB().ExecContext(ctx, query, userID, before)
 	if err != nil {
-		return fmt.Errorf("extend session expiry failed: %w", err)
+		return 0, fmt.Errorf("cleanup older than for user failed: %w", err)
 	}
 	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return interfaces.ErrSessionNotFound
-	}
-	return nil
+	return rows, nil
 }
 
 // ======================================================================
-= Bulk Operations
+// Advanced Queries
+// ======================================================================
+
+// GetLatestSession returns the most recent session for a user.
+func (r *sessionRepo) GetLatestSession(ctx context.Context, userID string) (*entities.Session, error) {
+	query := `
+		SELECT * FROM sessions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	var session entities.Session
+	err := r.getDB().GetContext(ctx, &session, query, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, interfaces.ErrSessionNotFound
+		}
+		return nil, fmt.Errorf("get latest session failed: %w", err)
+	}
+	return &session, nil
+}
+
+// GetOldestSession returns the oldest session for a user.
+func (r *sessionRepo) GetOldestSession(ctx context.Context, userID string) (*entities.Session, error) {
+	query := `
+		SELECT * FROM sessions
+		WHERE user_id = $1
+		ORDER BY created_at ASC
+		LIMIT 1
+	`
+	var session entities.Session
+	err := r.getDB().GetContext(ctx, &session, query, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, interfaces.ErrSessionNotFound
+		}
+		return nil, fmt.Errorf("get oldest session failed: %w", err)
+	}
+	return &session, nil
+}
+
+// GetSessionsByDateRange returns sessions within a date range.
+func (r *sessionRepo) GetSessionsByDateRange(ctx context.Context, start, end time.Time, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE created_at >= $1 AND created_at <= $2
+	`
+	if cursor != "" {
+		query += ` AND id > $3`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{start, end}
+	argIdx := 3
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 4
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions by date range failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetSessionsForUserByDateRange returns sessions for a user within a date range.
+func (r *sessionRepo) GetSessionsForUserByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3
+	`
+	if cursor != "" {
+		query += ` AND id > $4`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID, start, end}
+	argIdx := 4
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 5
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions for user by date range failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetSessionsByUserAndIP returns sessions for a user from a specific IP.
+func (r *sessionRepo) GetSessionsByUserAndIP(ctx context.Context, userID, ip string, cursor string, limit int) ([]*entities.Session, string, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE user_id = $1 AND ip = $2
+	`
+	if cursor != "" {
+		query += ` AND id > $3`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{userID, ip}
+	argIdx := 3
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 4
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions by user and IP failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// GetSessionsWithMetadata returns sessions with specific metadata.
+func (r *sessionRepo) GetSessionsWithMetadata(ctx context.Context, key, value string, cursor string, limit int) ([]*entities.Session, string, error) {
+	// This is a simplified version; in real scenario, we'd use JSONB queries
+	// For PostgreSQL, we'd use `metadata->>$1 = $2`
+	if limit < 1 {
+		limit = 20
+	}
+	query := `
+		SELECT * FROM sessions
+		WHERE metadata->>$1 = $2
+	`
+	if cursor != "" {
+		query += ` AND id > $3`
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
+
+	args := []interface{}{key, value}
+	argIdx := 3
+	if cursor != "" {
+		args = append(args, cursor)
+		argIdx = 4
+	}
+	args = append(args, limit)
+	query = r.getDB().Rebind(query)
+
+	var sessions []*entities.Session
+	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("get sessions with metadata failed: %w", err)
+	}
+	var nextCursor string
+	if len(sessions) == limit {
+		nextCursor = sessions[len(sessions)-1].ID
+	}
+	return sessions, nextCursor, nil
+}
+
+// ======================================================================
+// Bulk Operations
 // ======================================================================
 
 // BulkCreate inserts multiple sessions in a single transaction.
@@ -457,12 +976,53 @@ func (r *sessionRepo) BulkDelete(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// BulkDeleteByUserID removes all sessions for a user.
-func (r *sessionRepo) BulkDeleteByUserID(ctx context.Context, userID string) error {
-	query := `DELETE FROM sessions WHERE user_id = $1`
-	_, err := r.getDB().ExecContext(ctx, query, userID)
+// BulkDeleteByUserIDs removes all sessions for multiple users.
+func (r *sessionRepo) BulkDeleteByUserIDs(ctx context.Context, userIDs []string) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	query, args, err := sqlx.In(`DELETE FROM sessions WHERE user_id IN (?)`, userIDs)
 	if err != nil {
-		return fmt.Errorf("bulk delete sessions by user failed: %w", err)
+		return err
+	}
+	query = r.getDB().Rebind(query)
+	_, err = r.getDB().ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("bulk delete by user IDs failed: %w", err)
+	}
+	return nil
+}
+
+// BulkRevoke revokes multiple sessions.
+func (r *sessionRepo) BulkRevoke(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	query, args, err := sqlx.In(`UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE id IN (?)`, time.Now(), time.Now(), ids)
+	if err != nil {
+		return err
+	}
+	query = r.getDB().Rebind(query)
+	_, err = r.getDB().ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("bulk revoke sessions failed: %w", err)
+	}
+	return nil
+}
+
+// BulkExtendExpiry extends expiry for multiple sessions.
+func (r *sessionRepo) BulkExtendExpiry(ctx context.Context, ids []string, newExpiry time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	query, args, err := sqlx.In(`UPDATE sessions SET expires_at = $1, updated_at = $2 WHERE id IN (?)`, newExpiry, time.Now(), ids)
+	if err != nil {
+		return err
+	}
+	query = r.getDB().Rebind(query)
+	_, err = r.getDB().ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("bulk extend expiry failed: %w", err)
 	}
 	return nil
 }
@@ -473,151 +1033,57 @@ func (r *sessionRepo) BulkDeleteExpired(ctx context.Context) (int64, error) {
 }
 
 // ======================================================================
-= Advanced Queries
-// ======================================================================
-
-// GetSessionsByIP returns all sessions from a specific IP.
-func (r *sessionRepo) GetSessionsByIP(ctx context.Context, ip string) ([]*entities.Session, error) {
-	query := `SELECT * FROM sessions WHERE ip = $1 ORDER BY created_at DESC`
-	var sessions []*entities.Session
-	err := r.getDB().SelectContext(ctx, &sessions, query, ip)
-	if err != nil {
-		return nil, fmt.Errorf("get sessions by IP failed: %w", err)
-	}
-	return sessions, nil
-}
-
-// GetSessionsByUserAgent returns all sessions with a specific user agent.
-func (r *sessionRepo) GetSessionsByUserAgent(ctx context.Context, userAgent string) ([]*entities.Session, error) {
-	query := `SELECT * FROM sessions WHERE user_agent = $1 ORDER BY created_at DESC`
-	var sessions []*entities.Session
-	err := r.getDB().SelectContext(ctx, &sessions, query, userAgent)
-	if err != nil {
-		return nil, fmt.Errorf("get sessions by user agent failed: %w", err)
-	}
-	return sessions, nil
-}
-
-// GetSessionsByDateRange returns sessions within a date range.
-func (r *sessionRepo) GetSessionsByDateRange(ctx context.Context, start, end time.Time, cursor string, limit int) ([]*entities.Session, string, error) {
-	if limit < 1 {
-		limit = 20
-	}
-	query := `
-		SELECT * FROM sessions
-		WHERE created_at >= $1 AND created_at <= $2
-	`
-	if cursor != "" {
-		query += ` AND id > $3`
-	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT $?`
-
-	args := []interface{}{start, end}
-	argIndex := 3
-	if cursor != "" {
-		args = append(args, cursor)
-		argIndex = 4
-	}
-	args = append(args, limit)
-	query = r.getDB().Rebind(query)
-
-	var sessions []*entities.Session
-	err := r.getDB().SelectContext(ctx, &sessions, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("get sessions by date range failed: %w", err)
-	}
-
-	var nextCursor string
-	if len(sessions) == limit {
-		nextCursor = sessions[len(sessions)-1].ID
-	}
-	return sessions, nextCursor, nil
-}
-
-// ======================================================================
-= Stats and Analytics
+// Stats and Analytics
 // ======================================================================
 
 // GetSessionStats returns aggregated session statistics.
-func (r *sessionRepo) GetSessionStats(ctx context.Context) (*SessionStats, error) {
+func (r *sessionRepo) GetSessionStats(ctx context.Context) (*interfaces.SessionStats, error) {
 	query := `
 		SELECT 
-			COUNT(*) as total,
+			COUNT(*) as total_sessions,
+			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active_sessions,
+			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired_sessions,
 			COUNT(DISTINCT user_id) as unique_users,
-			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active,
-			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired,
-			MAX(created_at) as latest_session,
-			MIN(created_at) as earliest_session,
-			AVG(EXTRACT(EPOCH FROM (expires_at - created_at))) as avg_lifetime_seconds,
 			COUNT(DISTINCT ip) as unique_ips,
-			COUNT(DISTINCT user_agent) as unique_user_agents
+			COUNT(DISTINCT user_agent) as unique_user_agents,
+			AVG(EXTRACT(EPOCH FROM (expires_at - created_at))) as avg_session_duration,
+			MAX(expires_at - created_at) as max_session_duration,
+			MIN(expires_at - created_at) as min_session_duration,
+			MAX(created_at) as last_session_created,
+			MAX(expires_at) as last_session_expired
 		FROM sessions
 	`
-	var stats SessionStats
+	var stats interfaces.SessionStats
 	err := r.getDB().GetContext(ctx, &stats, query)
 	if err != nil {
 		return nil, fmt.Errorf("get session stats failed: %w", err)
 	}
+	// Handle NULL values
+	if stats.AvgSessionDuration == 0 {
+		stats.AvgSessionDuration = 0
+	}
 	return &stats, nil
 }
 
-// SessionStats represents aggregated session statistics.
-type SessionStats struct {
-	Total              int64     `db:"total"`
-	UniqueUsers        int64     `db:"unique_users"`
-	Active             int64     `db:"active"`
-	Expired            int64     `db:"expired"`
-	LatestSession      time.Time `db:"latest_session"`
-	EarliestSession    time.Time `db:"earliest_session"`
-	AvgLifetimeSeconds float64   `db:"avg_lifetime_seconds"`
-	UniqueIPs          int64     `db:"unique_ips"`
-	UniqueUserAgents   int64     `db:"unique_user_agents"`
-}
-
-// GetDailySessions returns daily session creation counts.
-func (r *sessionRepo) GetDailySessions(ctx context.Context, start, end time.Time) ([]*DailySessionCount, error) {
-	query := `
-		SELECT 
-			DATE(created_at) as date,
-			COUNT(*) as total,
-			COUNT(DISTINCT user_id) as unique_users,
-			COUNT(DISTINCT ip) as unique_ips
-		FROM sessions
-		WHERE created_at >= $1 AND created_at <= $2
-		GROUP BY DATE(created_at)
-		ORDER BY date ASC
-	`
-	var results []*DailySessionCount
-	err := r.getDB().SelectContext(ctx, &results, query, start, end)
-	if err != nil {
-		return nil, fmt.Errorf("get daily sessions failed: %w", err)
-	}
-	return results, nil
-}
-
-// DailySessionCount represents daily session counts.
-type DailySessionCount struct {
-	Date       time.Time `db:"date"`
-	Total      int64     `db:"total"`
-	UniqueUsers int64    `db:"unique_users"`
-	UniqueIPs  int64     `db:"unique_ips"`
-}
-
 // GetUserSessionStats returns session statistics for a specific user.
-func (r *sessionRepo) GetUserSessionStats(ctx context.Context, userID string) (*UserSessionStats, error) {
+func (r *sessionRepo) GetUserSessionStats(ctx context.Context, userID string) (*interfaces.SessionStats, error) {
 	query := `
 		SELECT 
-			COUNT(*) as total,
-			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active,
-			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired,
-			MAX(created_at) as latest_session,
-			MIN(created_at) as earliest_session,
+			COUNT(*) as total_sessions,
+			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active_sessions,
+			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired_sessions,
+			1 as unique_users,
 			COUNT(DISTINCT ip) as unique_ips,
-			COUNT(DISTINCT user_agent) as unique_user_agents
+			COUNT(DISTINCT user_agent) as unique_user_agents,
+			AVG(EXTRACT(EPOCH FROM (expires_at - created_at))) as avg_session_duration,
+			MAX(expires_at - created_at) as max_session_duration,
+			MIN(expires_at - created_at) as min_session_duration,
+			MAX(created_at) as last_session_created,
+			MAX(expires_at) as last_session_expired
 		FROM sessions
 		WHERE user_id = $1
 	`
-	var stats UserSessionStats
+	var stats interfaces.SessionStats
 	err := r.getDB().GetContext(ctx, &stats, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get user session stats failed: %w", err)
@@ -625,19 +1091,54 @@ func (r *sessionRepo) GetUserSessionStats(ctx context.Context, userID string) (*
 	return &stats, nil
 }
 
-// UserSessionStats represents session statistics for a user.
-type UserSessionStats struct {
-	Total            int64     `db:"total"`
-	Active           int64     `db:"active"`
-	Expired          int64     `db:"expired"`
-	LatestSession    time.Time `db:"latest_session"`
-	EarliestSession  time.Time `db:"earliest_session"`
-	UniqueIPs        int64     `db:"unique_ips"`
-	UniqueUserAgents int64     `db:"unique_user_agents"`
+// GetDailySessionStats returns daily session counts for a date range.
+func (r *sessionRepo) GetDailySessionStats(ctx context.Context, start, end time.Time) ([]*interfaces.DailySessionCount, error) {
+	query := `
+		SELECT 
+			DATE(created_at) as date,
+			COUNT(*) as total,
+			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active,
+			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired,
+			COUNT(DISTINCT user_id) as unique_users,
+			COUNT(DISTINCT ip) as unique_ips
+		FROM sessions
+		WHERE created_at >= $1 AND created_at <= $2
+		GROUP BY DATE(created_at)
+		ORDER BY date ASC
+	`
+	var results []*interfaces.DailySessionCount
+	err := r.getDB().SelectContext(ctx, &results, query, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("get daily session stats failed: %w", err)
+	}
+	return results, nil
 }
 
-// GetSessionDeviceStats returns session statistics by user agent.
-func (r *sessionRepo) GetSessionDeviceStats(ctx context.Context, userID string) ([]*DeviceStat, error) {
+// GetDailySessionStatsForUser returns daily session counts for a user.
+func (r *sessionRepo) GetDailySessionStatsForUser(ctx context.Context, userID string, start, end time.Time) ([]*interfaces.DailySessionCount, error) {
+	query := `
+		SELECT 
+			DATE(created_at) as date,
+			COUNT(*) as total,
+			SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active,
+			SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired,
+			1 as unique_users,
+			COUNT(DISTINCT ip) as unique_ips
+		FROM sessions
+		WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3
+		GROUP BY DATE(created_at)
+		ORDER BY date ASC
+	`
+	var results []*interfaces.DailySessionCount
+	err := r.getDB().SelectContext(ctx, &results, query, userID, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("get daily session stats for user failed: %w", err)
+	}
+	return results, nil
+}
+
+// GetDeviceStats returns session statistics by user agent.
+func (r *sessionRepo) GetDeviceStats(ctx context.Context, userID string) ([]*interfaces.DeviceStat, error) {
 	query := `
 		SELECT 
 			user_agent,
@@ -648,7 +1149,7 @@ func (r *sessionRepo) GetSessionDeviceStats(ctx context.Context, userID string) 
 		GROUP BY user_agent
 		ORDER BY count DESC
 	`
-	var stats []*DeviceStat
+	var stats []*interfaces.DeviceStat
 	err := r.getDB().SelectContext(ctx, &stats, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get device stats failed: %w", err)
@@ -656,51 +1157,75 @@ func (r *sessionRepo) GetSessionDeviceStats(ctx context.Context, userID string) 
 	return stats, nil
 }
 
-// DeviceStat represents device statistics.
-type DeviceStat struct {
-	UserAgent string    `db:"user_agent"`
-	Count     int64     `db:"count"`
-	LastUsed  time.Time `db:"last_used"`
-}
-
-// ======================================================================
-= Session Validation
-// ======================================================================
-
-// IsValidSession checks if a session exists and is active.
-func (r *sessionRepo) IsValidSession(ctx context.Context, id string) (bool, error) {
+// GetLocationStats returns session statistics by IP (geo-location based).
+func (r *sessionRepo) GetLocationStats(ctx context.Context, userID string) ([]*interfaces.LocationStat, error) {
 	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM sessions
-			WHERE id = $1 AND expires_at > NOW()
-		)
+		SELECT 
+			ip,
+			COUNT(*) as count,
+			MAX(created_at) as last_used
+		FROM sessions
+		WHERE user_id = $1
+		GROUP BY ip
+		ORDER BY count DESC
 	`
-	var valid bool
-	err := r.getDB().GetContext(ctx, &valid, query, id)
+	var stats []*interfaces.LocationStat
+	err := r.getDB().SelectContext(ctx, &stats, query, userID)
 	if err != nil {
-		return false, fmt.Errorf("check session validity failed: %w", err)
+		return nil, fmt.Errorf("get location stats failed: %w", err)
 	}
-	return valid, nil
+	// In production, we would resolve IP to geo-location, but for now just IP
+	return stats, nil
 }
 
-// IsValidRefreshToken checks if a refresh token is valid and active.
-func (r *sessionRepo) IsValidRefreshToken(ctx context.Context, refreshToken string) (bool, error) {
+// GetAverageSessionDuration calculates average session duration for a user.
+func (r *sessionRepo) GetAverageSessionDuration(ctx context.Context, userID string) (float64, error) {
 	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM sessions
-			WHERE refresh_token = $1 AND expires_at > NOW()
-		)
+		SELECT AVG(EXTRACT(EPOCH FROM (expires_at - created_at)))
+		FROM sessions
+		WHERE user_id = $1
 	`
-	var valid bool
-	err := r.getDB().GetContext(ctx, &valid, query, refreshToken)
+	var avg float64
+	err := r.getDB().GetContext(ctx, &avg, query, userID)
 	if err != nil {
-		return false, fmt.Errorf("check refresh token validity failed: %w", err)
+		return 0, fmt.Errorf("get average session duration failed: %w", err)
 	}
-	return valid, nil
+	return avg, nil
+}
+
+// GetSessionRetentionRate calculates session retention rate.
+func (r *sessionRepo) GetSessionRetentionRate(ctx context.Context, days int) (float64, error) {
+	startDate := time.Now().AddDate(0, 0, -days)
+	// Count users who had at least one session in the period
+	var activeUsers int64
+	err := r.getDB().GetContext(ctx, &activeUsers,
+		`SELECT COUNT(DISTINCT user_id) FROM sessions WHERE created_at >= $1`, startDate)
+	if err != nil {
+		return 0, fmt.Errorf("get active users failed: %w", err)
+	}
+	// Count users who had at least one session in the period and another after that
+	var retainedUsers int64
+	err = r.getDB().GetContext(ctx, &retainedUsers,
+		`SELECT COUNT(DISTINCT user_id)
+		 FROM sessions s1
+		 WHERE s1.created_at >= $1
+		 AND EXISTS (
+		   SELECT 1 FROM sessions s2
+		   WHERE s2.user_id = s1.user_id
+		   AND s2.created_at > s1.created_at
+		   AND s2.created_at <= NOW()
+		 )`, startDate)
+	if err != nil {
+		return 0, fmt.Errorf("get retained users failed: %w", err)
+	}
+	if activeUsers == 0 {
+		return 0, nil
+	}
+	return float64(retainedUsers) / float64(activeUsers) * 100, nil
 }
 
 // ======================================================================
-= Health
+// Health
 // ======================================================================
 
 func (r *sessionRepo) Ping(ctx context.Context) error {
