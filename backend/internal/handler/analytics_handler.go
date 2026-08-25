@@ -24,6 +24,7 @@ type AnalyticsHandler struct {
 	analyticsService service.AnalyticsService
 	userService      service.UserService
 	tweetService     service.TweetService
+	followService    service.FollowService
 	log              *logrus.Entry
 }
 
@@ -32,11 +33,13 @@ func NewAnalyticsHandler(
 	analyticsService service.AnalyticsService,
 	userService service.UserService,
 	tweetService service.TweetService,
+	followService service.FollowService,
 ) *AnalyticsHandler {
 	return &AnalyticsHandler{
 		analyticsService: analyticsService,
 		userService:      userService,
 		tweetService:     tweetService,
+		followService:    followService,
 		log:              logger.WithField("handler", "analytics"),
 	}
 }
@@ -53,6 +56,7 @@ func NewAnalyticsHandler(
 // @Produce json
 // @Param days query int false "Number of days to analyze (default 7, max 30)"
 // @Param metrics query string false "Comma-separated metrics to include (tweets,likes,retweets,replies,followers)"
+// @Param granularity query string false "Time granularity (hourly, daily, weekly) default daily"
 // @Success 200 {object} dto.UserAnalyticsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -73,8 +77,12 @@ func (h *AnalyticsHandler) GetUserAnalytics(w http.ResponseWriter, r *http.Reque
 	if len(metrics) == 0 || metricsParam == "" {
 		metrics = []string{"tweets", "likes", "retweets", "replies", "followers"}
 	}
+	granularity := r.URL.Query().Get("granularity")
+	if granularity == "" {
+		granularity = "daily"
+	}
 
-	analytics, err := h.analyticsService.GetUserAnalytics(r.Context(), userID, days, metrics)
+	analytics, err := h.analyticsService.GetUserAnalytics(r.Context(), userID, days, metrics, granularity)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get user analytics")
 		return
@@ -84,7 +92,7 @@ func (h *AnalyticsHandler) GetUserAnalytics(w http.ResponseWriter, r *http.Reque
 }
 
 // ======================================================================
-// Get Tweet Analytics
+= Get Tweet Analytics
 // ======================================================================
 
 // GetTweetAnalytics handles retrieving analytics for a specific tweet.
@@ -144,6 +152,128 @@ func (h *AnalyticsHandler) GetTweetAnalytics(w http.ResponseWriter, r *http.Requ
 }
 
 // ======================================================================
+= Get Engagement Analytics
+// ======================================================================
+
+// GetEngagementAnalytics handles retrieving engagement analytics for the user.
+// @Summary Get engagement analytics
+// @Description Retrieves engagement analytics (likes, retweets, replies, etc.) for the authenticated user
+// @Tags analytics
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Param include_breakdown query bool false "Include engagement breakdown by day"
+// @Success 200 {object} dto.EngagementAnalyticsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/analytics/engagement [get]
+func (h *AnalyticsHandler) GetEngagementAnalytics(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+	includeBreakdown, _ := strconv.ParseBool(r.URL.Query().Get("include_breakdown"))
+
+	analytics, err := h.analyticsService.GetEngagementAnalytics(r.Context(), userID, days, includeBreakdown)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get engagement analytics")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, analytics)
+}
+
+// ======================================================================
+= Get Follower Growth Analytics
+// ======================================================================
+
+// GetFollowerGrowthAnalytics handles retrieving follower growth analytics.
+// @Summary Get follower growth analytics
+// @Description Retrieves follower growth data over time for the authenticated user
+// @Tags analytics
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Param include_projections query bool false "Include growth projections"
+// @Success 200 {object} dto.FollowerGrowthResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/analytics/followers [get]
+func (h *AnalyticsHandler) GetFollowerGrowthAnalytics(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+	includeProjections, _ := strconv.ParseBool(r.URL.Query().Get("include_projections"))
+
+	growth, err := h.analyticsService.GetFollowerGrowth(r.Context(), userID, days, includeProjections)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get follower growth")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, growth)
+}
+
+// ======================================================================
+= Get Tweet Performance Analytics
+// ======================================================================
+
+// GetTweetPerformanceAnalytics handles retrieving tweet performance analytics.
+// @Summary Get tweet performance analytics
+// @Description Retrieves performance metrics for all tweets of the authenticated user
+// @Tags analytics
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Param limit query int false "Number of top tweets to return (default 10, max 50)"
+// @Param order_by query string false "Order by (likes, retweets, replies, views)"
+// @Success 200 {object} dto.TweetPerformanceResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/analytics/tweet-performance [get]
+func (h *AnalyticsHandler) GetTweetPerformanceAnalytics(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 50 {
+		limit = 10
+	}
+	orderBy := r.URL.Query().Get("order_by")
+	if orderBy == "" {
+		orderBy = "likes"
+	}
+
+	performance, err := h.analyticsService.GetTweetPerformance(r.Context(), userID, days, limit, orderBy)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get tweet performance")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, performance)
+}
+
+// ======================================================================
 = Get User Analytics (Admin)
 // ======================================================================
 
@@ -194,7 +324,7 @@ func (h *AnalyticsHandler) AdminGetUserAnalytics(w http.ResponseWriter, r *http.
 		return
 	}
 
-	analytics, err := h.analyticsService.GetUserAnalytics(r.Context(), targetUserID, days, metrics)
+	analytics, err := h.analyticsService.GetUserAnalytics(r.Context(), targetUserID, days, metrics, "daily")
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get user analytics")
 		return
@@ -248,119 +378,6 @@ func (h *AnalyticsHandler) AdminGetPlatformAnalytics(w http.ResponseWriter, r *h
 }
 
 // ======================================================================
-= Get Engagement Analytics
-// ======================================================================
-
-// GetEngagementAnalytics handles retrieving engagement analytics for the user.
-// @Summary Get engagement analytics
-// @Description Retrieves engagement analytics (likes, retweets, replies, etc.) for the authenticated user
-// @Tags analytics
-// @Security BearerAuth
-// @Produce json
-// @Param days query int false "Number of days to analyze (default 7, max 30)"
-// @Success 200 {object} dto.EngagementAnalyticsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/analytics/engagement [get]
-func (h *AnalyticsHandler) GetEngagementAnalytics(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	days, err := strconv.Atoi(r.URL.Query().Get("days"))
-	if err != nil || days < 1 || days > 30 {
-		days = 7
-	}
-
-	analytics, err := h.analyticsService.GetEngagementAnalytics(r.Context(), userID, days)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get engagement analytics")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, analytics)
-}
-
-// ======================================================================
-= Get Follower Growth Analytics
-// ======================================================================
-
-// GetFollowerGrowthAnalytics handles retrieving follower growth analytics.
-// @Summary Get follower growth analytics
-// @Description Retrieves follower growth data over time for the authenticated user
-// @Tags analytics
-// @Security BearerAuth
-// @Produce json
-// @Param days query int false "Number of days to analyze (default 7, max 30)"
-// @Success 200 {object} dto.FollowerGrowthResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/analytics/followers [get]
-func (h *AnalyticsHandler) GetFollowerGrowthAnalytics(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	days, err := strconv.Atoi(r.URL.Query().Get("days"))
-	if err != nil || days < 1 || days > 30 {
-		days = 7
-	}
-
-	growth, err := h.analyticsService.GetFollowerGrowth(r.Context(), userID, days)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get follower growth")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, growth)
-}
-
-// ======================================================================
-= Get Tweet Performance Analytics
-// ======================================================================
-
-// GetTweetPerformanceAnalytics handles retrieving tweet performance analytics.
-// @Summary Get tweet performance analytics
-// @Description Retrieves performance metrics for all tweets of the authenticated user
-// @Tags analytics
-// @Security BearerAuth
-// @Produce json
-// @Param days query int false "Number of days to analyze (default 7, max 30)"
-// @Param limit query int false "Number of top tweets to return (default 10, max 50)"
-// @Success 200 {object} dto.TweetPerformanceResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/analytics/tweet-performance [get]
-func (h *AnalyticsHandler) GetTweetPerformanceAnalytics(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	days, err := strconv.Atoi(r.URL.Query().Get("days"))
-	if err != nil || days < 1 || days > 30 {
-		days = 7
-	}
-	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil || limit < 1 || limit > 50 {
-		limit = 10
-	}
-
-	performance, err := h.analyticsService.GetTweetPerformance(r.Context(), userID, days, limit)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get tweet performance")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, performance)
-}
-
-// ======================================================================
 = Get Dashboard Analytics (Admin)
 // ======================================================================
 
@@ -408,7 +425,7 @@ func (h *AnalyticsHandler) AdminGetDashboardAnalytics(w http.ResponseWriter, r *
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Param window query string false "Time window (1h, 6h, 24h)"
+// @Param window query string false "Time window (1h, 6h, 24h, 7d)"
 // @Success 200 {object} dto.RealtimeAnalyticsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
@@ -446,7 +463,8 @@ func (h *AnalyticsHandler) AdminGetRealtimeAnalytics(w http.ResponseWriter, r *h
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Param sort_by query string false "Sort by (followers, engagement, tweets)"
+// @Param sort_by query string false "Sort by (followers, engagement, tweets, likes, retweets)"
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
 // @Param limit query int false "Number of users to return (default 10, max 50)"
 // @Success 200 {object} dto.TopUsersResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -465,12 +483,16 @@ func (h *AnalyticsHandler) AdminGetTopUsers(w http.ResponseWriter, r *http.Reque
 	if sortBy == "" {
 		sortBy = "followers"
 	}
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
 	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
 	if err != nil || limit < 1 || limit > 50 {
 		limit = 10
 	}
 
-	topUsers, err := h.analyticsService.GetTopUsers(r.Context(), sortBy, limit)
+	topUsers, err := h.analyticsService.GetTopUsers(r.Context(), sortBy, days, limit)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get top users")
 		return
@@ -489,7 +511,7 @@ func (h *AnalyticsHandler) AdminGetTopUsers(w http.ResponseWriter, r *http.Reque
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Param sort_by query string false "Sort by (likes, retweets, replies)"
+// @Param sort_by query string false "Sort by (likes, retweets, replies, views)"
 // @Param days query int false "Number of days to analyze (default 7, max 30)"
 // @Param limit query int false "Number of tweets to return (default 10, max 50)"
 // @Success 200 {object} dto.TopTweetsResponse
@@ -539,7 +561,9 @@ func (h *AnalyticsHandler) AdminGetTopTweets(w http.ResponseWriter, r *http.Requ
 // @Produce application/json, text/csv
 // @Param format query string false "Export format (json, csv)"
 // @Param days query int false "Number of days to analyze (default 7, max 30)"
-// @Param report_type query string false "Report type (users, tweets, engagements)"
+// @Param report_type query string false "Report type (users, tweets, engagements, followers)"
+// @Param start_date query string false "Start date (YYYY-MM-DD)"
+// @Param end_date query string false "End date (YYYY-MM-DD)"
 // @Success 200 {file} file
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
@@ -565,8 +589,19 @@ func (h *AnalyticsHandler) AdminExportAnalytics(w http.ResponseWriter, r *http.R
 	if reportType == "" {
 		reportType = "tweets"
 	}
+	startDate := r.URL.Query().Get("start_date")
+	endDate := r.URL.Query().Get("end_date")
 
-	exportData, err := h.analyticsService.ExportAnalytics(r.Context(), reportType, days, format)
+	// Parse dates if provided
+	var start, end time.Time
+	if startDate != "" {
+		start, _ = time.Parse("2006-01-02", startDate)
+	}
+	if endDate != "" {
+		end, _ = time.Parse("2006-01-02", endDate)
+	}
+
+	exportData, err := h.analyticsService.ExportAnalytics(r.Context(), reportType, days, start, end, format)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to export analytics")
 		return
@@ -581,6 +616,87 @@ func (h *AnalyticsHandler) AdminExportAnalytics(w http.ResponseWriter, r *http.R
 		w.Header().Set("Content-Disposition", "attachment; filename=analytics_export.json")
 		w.Write(exportData)
 	}
+}
+
+// ======================================================================
+= Get Analytics Summary (Admin)
+// ======================================================================
+
+// AdminGetAnalyticsSummary handles retrieving a summary of all analytics.
+// @Summary Admin get analytics summary
+// @Description Retrieves a comprehensive analytics summary (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.AnalyticsSummaryResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/analytics/summary [get]
+func (h *AnalyticsHandler) AdminGetAnalyticsSummary(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	summary, err := h.analyticsService.GetAnalyticsSummary(r.Context(), days)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get analytics summary")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, summary)
+}
+
+// ======================================================================
+= Get Retention Analytics (Admin)
+// ======================================================================
+
+// AdminGetRetentionAnalytics handles retrieving user retention analytics.
+// @Summary Admin get retention analytics
+// @Description Retrieves user retention analytics (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param cohort query string false "Cohort period (weekly, monthly)"
+// @Param days query int false "Number of days to analyze (default 30, max 90)"
+// @Success 200 {object} dto.RetentionAnalyticsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/analytics/retention [get]
+func (h *AnalyticsHandler) AdminGetRetentionAnalytics(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	cohort := r.URL.Query().Get("cohort")
+	if cohort == "" {
+		cohort = "weekly"
+	}
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 90 {
+		days = 30
+	}
+
+	retention, err := h.analyticsService.GetRetentionAnalytics(r.Context(), cohort, days)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get retention analytics")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, retention)
 }
 
 // ======================================================================
@@ -633,6 +749,10 @@ func (h *AnalyticsHandler) handleServiceError(w http.ResponseWriter, err error, 
 		h.sendError(w, http.StatusInternalServerError, "Failed to export data", nil)
 	case errors.Is(err, service.ErrNoDataAvailable):
 		h.sendError(w, http.StatusNotFound, "No data available for the requested period", nil)
+	case errors.Is(err, service.ErrInvalidDateRange):
+		h.sendError(w, http.StatusBadRequest, "Invalid date range", nil)
+	case errors.Is(err, service.ErrInvalidGranularity):
+		h.sendError(w, http.StatusBadRequest, "Invalid granularity", nil)
 	case errors.Is(err, service.ErrUserNotFound):
 		h.sendError(w, http.StatusNotFound, "User not found", nil)
 	case errors.Is(err, service.ErrTweetNotFound):
