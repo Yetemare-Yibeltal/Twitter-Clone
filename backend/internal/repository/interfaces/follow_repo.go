@@ -25,27 +25,7 @@ var (
 )
 
 // ======================================================================
-// FollowFilter
-// ======================================================================
-
-// FollowFilter defines filtering options for follow queries.
-type FollowFilter struct {
-	FollowerID   *string
-	FolloweeID   *string
-	Status       *FollowStatus
-	CreatedFrom  *time.Time
-	CreatedTo    *time.Time
-	Mutual       *bool
-}
-
-// HasCriteria checks if any filter criteria are set.
-func (f *FollowFilter) HasCriteria() bool {
-	return f.FollowerID != nil || f.FolloweeID != nil || f.Status != nil ||
-		f.CreatedFrom != nil || f.CreatedTo != nil || f.Mutual != nil
-}
-
-// ======================================================================
-= FollowStatus
+// FollowStatus
 // ======================================================================
 
 // FollowStatus represents the status of a follow relationship.
@@ -68,7 +48,27 @@ func (s FollowStatus) IsValid() bool {
 }
 
 // ======================================================================
-= FollowPagination
+// FollowFilter
+// ======================================================================
+
+// FollowFilter defines filtering options for follow queries.
+type FollowFilter struct {
+	FollowerID   *string
+	FolloweeID   *string
+	Status       *FollowStatus
+	CreatedFrom  *time.Time
+	CreatedTo    *time.Time
+	Mutual       *bool
+}
+
+// HasCriteria checks if any filter criteria are set.
+func (f *FollowFilter) HasCriteria() bool {
+	return f.FollowerID != nil || f.FolloweeID != nil || f.Status != nil ||
+		f.CreatedFrom != nil || f.CreatedTo != nil || f.Mutual != nil
+}
+
+// ======================================================================
+// FollowPagination
 // ======================================================================
 
 // FollowSortField defines sortable fields for follows.
@@ -90,10 +90,10 @@ const (
 
 // FollowPagination holds pagination options for follows.
 type FollowPagination struct {
-	Cursor string            `json:"cursor"`
-	Limit  int               `json:"limit"`
-	SortBy FollowSortField   `json:"sort_by"`
-	Order  FollowSortOrder   `json:"order"`
+	Cursor string           `json:"cursor"`
+	Limit  int              `json:"limit"`
+	SortBy FollowSortField  `json:"sort_by"`
+	Order  FollowSortOrder  `json:"order"`
 }
 
 // DefaultFollowPagination returns default pagination options.
@@ -114,57 +114,57 @@ func (p *FollowPagination) Validate() error {
 }
 
 // ======================================================================
-= FollowStats
+// FollowStats
 // ======================================================================
 
 // FollowStats represents aggregated follow statistics.
 type FollowStats struct {
-	TotalFollows     int64     `json:"total_follows"`
-	UniqueFollowers  int64     `json:"unique_followers"`
-	UniqueFollowees  int64     `json:"unique_followees"`
-	PendingFollows   int64     `json:"pending_follows"`
-	AcceptedFollows  int64     `json:"accepted_follows"`
-	RejectedFollows  int64     `json:"rejected_follows"`
-	BlockedFollows   int64     `json:"blocked_follows"`
-	LastFollow       time.Time `json:"last_follow"`
-	FirstFollow      time.Time `json:"first_follow"`
-	AverageFollowers float64   `json:"average_followers"`
-	MaxFollowers     int64     `json:"max_followers"`
-	MinFollowers     int64     `json:"min_followers"`
+	TotalFollows    int64     `json:"total_follows"`
+	UniqueFollowers int64     `json:"unique_followers"`
+	UniqueFollowees int64     `json:"unique_followees"`
+	PendingFollows  int64     `json:"pending_follows"`
+	AcceptedFollows int64     `json:"accepted_follows"`
+	RejectedFollows int64     `json:"rejected_follows"`
+	BlockedFollows  int64     `json:"blocked_follows"`
+	LastFollow      time.Time `json:"last_follow"`
+	FirstFollow     time.Time `json:"first_follow"`
+	AverageFollowers float64  `json:"average_followers"`
+	MaxFollowers    int64     `json:"max_followers"`
+	MinFollowers    int64     `json:"min_followers"`
 }
 
 // ======================================================================
-= DailyFollowCount
+// DailyFollowCount
 // ======================================================================
 
 // DailyFollowCount represents daily follow counts.
 type DailyFollowCount struct {
-	Date           time.Time `json:"date"`
-	Total          int64     `json:"total"`
-	NewFollowers   int64     `json:"new_followers"`
-	NewFollowees   int64     `json:"new_followees"`
-	PendingCount   int64     `json:"pending_count"`
-	AcceptedCount  int64     `json:"accepted_count"`
+	Date          time.Time `json:"date"`
+	Total         int64     `json:"total"`
+	NewFollowers  int64     `json:"new_followers"`
+	NewFollowees  int64     `json:"new_followees"`
+	PendingCount  int64     `json:"pending_count"`
+	AcceptedCount int64     `json:"accepted_count"`
 }
 
 // ======================================================================
-= FollowRecommendation
+// FollowRecommendation
 // ======================================================================
 
 // FollowRecommendation represents a recommended user to follow.
 type FollowRecommendation struct {
-	UserID         string  `json:"user_id"`
-	Username       string  `json:"username"`
-	FullName       string  `json:"full_name"`
-	AvatarURL      string  `json:"avatar_url"`
-	MutualCount    int64   `json:"mutual_count"`
-	FollowerCount  int64   `json:"follower_count"`
-	Score          float64 `json:"score"`
-	Reason         string  `json:"reason"`
+	UserID       string  `json:"user_id"`
+	Username     string  `json:"username"`
+	FullName     string  `json:"full_name"`
+	AvatarURL    string  `json:"avatar_url"`
+	MutualCount  int64   `json:"mutual_count"`
+	FollowerCount int64  `json:"follower_count"`
+	Score        float64 `json:"score"`
+	Reason       string  `json:"reason"`
 }
 
 // ======================================================================
-= FollowRepository Interface
+// FollowRepository Interface
 // ======================================================================
 
 // FollowRepository defines the interface for follow data persistence.
@@ -174,13 +174,13 @@ type FollowRepository interface {
 	// --------------------------------------------------------------------
 
 	// Create creates a follow relationship.
-	Create(ctx context.Context, follow *entities.Follow) error
+	Create(ctx context.Context, follow *Follow) error
 
 	// GetByID retrieves a follow by its ID.
-	GetByID(ctx context.Context, id string) (*entities.Follow, error)
+	GetByID(ctx context.Context, id string) (*Follow, error)
 
 	// GetByFollowerAndFollowee retrieves a follow relationship.
-	GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*entities.Follow, error)
+	GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*Follow, error)
 
 	// Delete removes a follow relationship.
 	Delete(ctx context.Context, followerID, followeeID string) error
@@ -231,19 +231,19 @@ type FollowRepository interface {
 	// --------------------------------------------------------------------
 
 	// GetFollowers returns the list of followers for a user with pagination.
-	GetFollowers(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowers(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetFollowersWithStatus returns followers with a specific status.
-	GetFollowersWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowersWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetFollowing returns the list of users a user is following with pagination.
-	GetFollowing(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowing(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetFollowingWithStatus returns following with a specific status.
-	GetFollowingWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowingWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetPendingRequests returns pending follow requests for a user.
-	GetPendingRequests(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetPendingRequests(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetFollowerIDs returns all follower IDs for a user (no pagination).
 	GetFollowerIDs(ctx context.Context, userID string) ([]string, error)
@@ -262,32 +262,10 @@ type FollowRepository interface {
 	GetMutualFollows(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]string, string, error)
 
 	// GetMutualFollowsDetailed returns detailed mutual follow information.
-	GetMutualFollowsDetailed(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetMutualFollowsDetailed(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetMutualCountsForUsers returns mutual counts for multiple users.
 	GetMutualCountsForUsers(ctx context.Context, userID string, targetUserIDs []string) (map[string]int64, error)
-
-	// --------------------------------------------------------------------
-	// Bulk Operations
-	// --------------------------------------------------------------------
-
-	// BulkCreate inserts multiple follows in a single transaction.
-	BulkCreate(ctx context.Context, follows []*entities.Follow) error
-
-	// BulkDelete removes multiple follows in a single transaction.
-	BulkDelete(ctx context.Context, followerIDs, followeeIDs []string) error
-
-	// BulkDeleteByUserID removes all follows where the user is involved.
-	BulkDeleteByUserID(ctx context.Context, userID string) error
-
-	// BulkDeleteByFollowerID removes all follows by a specific follower.
-	BulkDeleteByFollowerID(ctx context.Context, followerID string) error
-
-	// BulkDeleteByFolloweeID removes all follows to a specific followee.
-	BulkDeleteByFolloweeID(ctx context.Context, followeeID string) error
-
-	// BulkUpdateStatus updates status for multiple follows.
-	BulkUpdateStatus(ctx context.Context, ids []string, status FollowStatus) error
 
 	// --------------------------------------------------------------------
 	// Follow Recommendations
@@ -306,6 +284,28 @@ type FollowRepository interface {
 	GetPopularUsers(ctx context.Context, limit int, excludeUserID string) ([]string, error)
 
 	// --------------------------------------------------------------------
+	// Bulk Operations
+	// --------------------------------------------------------------------
+
+	// BulkCreate inserts multiple follows in a single transaction.
+	BulkCreate(ctx context.Context, follows []*Follow) error
+
+	// BulkDelete removes multiple follows in a single transaction.
+	BulkDelete(ctx context.Context, followerIDs, followeeIDs []string) error
+
+	// BulkDeleteByUserID removes all follows where the user is involved.
+	BulkDeleteByUserID(ctx context.Context, userID string) error
+
+	// BulkDeleteByFollowerID removes all follows by a specific follower.
+	BulkDeleteByFollowerID(ctx context.Context, followerID string) error
+
+	// BulkDeleteByFolloweeID removes all follows to a specific followee.
+	BulkDeleteByFolloweeID(ctx context.Context, followeeID string) error
+
+	// BulkUpdateStatus updates status for multiple follows.
+	BulkUpdateStatus(ctx context.Context, ids []string, status FollowStatus) error
+
+	// --------------------------------------------------------------------
 	// Stats and Analytics
 	// --------------------------------------------------------------------
 
@@ -322,10 +322,10 @@ type FollowRepository interface {
 	GetFollowGrowthRate(ctx context.Context, userID string, days int) (float64, error)
 
 	// GetTopFollowers returns users with the most followers (global).
-	GetTopFollowers(ctx context.Context, limit int) ([]*entities.User, error)
+	GetTopFollowers(ctx context.Context, limit int) ([]*User, error)
 
 	// GetTopFollowees returns users followed by the most people.
-	GetTopFollowees(ctx context.Context, limit int) ([]*entities.User, error)
+	GetTopFollowees(ctx context.Context, limit int) ([]*User, error)
 
 	// --------------------------------------------------------------------
 	// Advanced Queries
@@ -337,14 +337,14 @@ type FollowRepository interface {
 	// GetFollowerIntersection returns users who follow both users.
 	GetFollowerIntersection(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]string, string, error)
 
-	// GetFollowPaths returns the follow path between two users.
+	// GetFollowPaths returns the follow path between two users (graph traversal).
 	GetFollowPaths(ctx context.Context, userID1, userID2 string, maxDepth int) ([][]string, error)
 
 	// GetFollowersByDateRange returns followers within a date range.
-	GetFollowersByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowersByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Follow, string, error)
 
 	// GetFollowingByDateRange returns following within a date range.
-	GetFollowingByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Follow, string, error)
+	GetFollowingByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Follow, string, error)
 
 	// --------------------------------------------------------------------
 	// Transaction Support
@@ -374,7 +374,30 @@ type FollowRepository interface {
 }
 
 // ======================================================================
-= Helper Functions
+// Supporting Types
+// ======================================================================
+
+// Follow represents a follow relationship (used by repository).
+type Follow struct {
+	ID         string     `db:"id" json:"id"`
+	FollowerID string     `db:"follower_id" json:"follower_id"`
+	FolloweeID string     `db:"followee_id" json:"followee_id"`
+	Status     string     `db:"status" json:"status"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt  time.Time  `db:"updated_at" json:"updated_at"`
+	DeletedAt  *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+// User is a minimal representation for follow queries.
+type User struct {
+	ID         string `db:"id" json:"id"`
+	Username   string `db:"username" json:"username"`
+	FullName   string `db:"full_name" json:"full_name"`
+	AvatarURL  string `db:"avatar_url" json:"avatar_url"`
+}
+
+// ======================================================================
+// Helper Functions
 // ======================================================================
 
 // IsFollowNotFound checks if an error indicates a follow was not found.
@@ -393,27 +416,27 @@ func IsFollowError(err error) bool {
 }
 
 // ======================================================================
-= Mock Follow Repository (for testing)
+// Mock Follow Repository (for testing)
 // ======================================================================
 
 // MockFollowRepository is a mock implementation for testing.
 type MockFollowRepository struct {
-	Follows      map[string]*entities.Follow
-	UserFollows  map[string]map[string]bool // userID -> set of followed userIDs
-	Error        error
-	NextCursor   string
+	Follows    map[string]*Follow
+	UserFollows map[string]map[string]bool // userID -> followed userIDs
+	Error      error
+	NextCursor string
 }
 
 // NewMockFollowRepo creates a new mock repository.
 func NewMockFollowRepo() FollowRepository {
 	return &MockFollowRepository{
-		Follows:     make(map[string]*entities.Follow),
+		Follows:     make(map[string]*Follow),
 		UserFollows: make(map[string]map[string]bool),
 	}
 }
 
 // Create mock implementation.
-func (m *MockFollowRepository) Create(ctx context.Context, follow *entities.Follow) error {
+func (m *MockFollowRepository) Create(ctx context.Context, follow *Follow) error {
 	if m.Error != nil {
 		return m.Error
 	}
@@ -426,7 +449,7 @@ func (m *MockFollowRepository) Create(ctx context.Context, follow *entities.Foll
 }
 
 // GetByID mock implementation.
-func (m *MockFollowRepository) GetByID(ctx context.Context, id string) (*entities.Follow, error) {
+func (m *MockFollowRepository) GetByID(ctx context.Context, id string) (*Follow, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
@@ -437,7 +460,7 @@ func (m *MockFollowRepository) GetByID(ctx context.Context, id string) (*entitie
 }
 
 // GetByFollowerAndFollowee mock implementation.
-func (m *MockFollowRepository) GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*entities.Follow, error) {
+func (m *MockFollowRepository) GetByFollowerAndFollowee(ctx context.Context, followerID, followeeID string) (*Follow, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
@@ -578,16 +601,18 @@ func (m *MockFollowRepository) CountMutual(ctx context.Context, userID1, userID2
 	if m.Error != nil {
 		return 0, m.Error
 	}
+	// Get following of user1
+	following1 := make(map[string]bool)
+	for _, follow := range m.Follows {
+		if follow.FollowerID == userID1 && follow.Status == string(FollowStatusAccepted) {
+			following1[follow.FolloweeID] = true
+		}
+	}
+	// Count those that user2 also follows
 	count := int64(0)
-	for _, follow1 := range m.Follows {
-		if follow1.FollowerID == userID1 && follow1.Status == string(FollowStatusAccepted) {
-			for _, follow2 := range m.Follows {
-				if follow2.FollowerID == userID2 && follow2.FolloweeID == follow1.FolloweeID &&
-					follow2.Status == string(FollowStatusAccepted) {
-					count++
-					break
-				}
-			}
+	for _, follow := range m.Follows {
+		if follow.FollowerID == userID2 && follow.Status == string(FollowStatusAccepted) && following1[follow.FolloweeID] {
+			count++
 		}
 	}
 	return count, nil
@@ -622,11 +647,11 @@ func (m *MockFollowRepository) CountPendingRequestsFromUser(ctx context.Context,
 }
 
 // GetFollowers mock implementation.
-func (m *MockFollowRepository) GetFollowers(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowers(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
+	var follows []*Follow
 	for _, follow := range m.Follows {
 		if follow.FolloweeID == userID {
 			follows = append(follows, follow)
@@ -636,11 +661,11 @@ func (m *MockFollowRepository) GetFollowers(ctx context.Context, userID string, 
 }
 
 // GetFollowersWithStatus mock implementation.
-func (m *MockFollowRepository) GetFollowersWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowersWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
+	var follows []*Follow
 	for _, follow := range m.Follows {
 		if follow.FolloweeID == userID && follow.Status == string(status) {
 			follows = append(follows, follow)
@@ -650,11 +675,11 @@ func (m *MockFollowRepository) GetFollowersWithStatus(ctx context.Context, userI
 }
 
 // GetFollowing mock implementation.
-func (m *MockFollowRepository) GetFollowing(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowing(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
+	var follows []*Follow
 	for _, follow := range m.Follows {
 		if follow.FollowerID == userID {
 			follows = append(follows, follow)
@@ -664,11 +689,11 @@ func (m *MockFollowRepository) GetFollowing(ctx context.Context, userID string, 
 }
 
 // GetFollowingWithStatus mock implementation.
-func (m *MockFollowRepository) GetFollowingWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowingWithStatus(ctx context.Context, userID string, status FollowStatus, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
+	var follows []*Follow
 	for _, follow := range m.Follows {
 		if follow.FollowerID == userID && follow.Status == string(status) {
 			follows = append(follows, follow)
@@ -678,11 +703,11 @@ func (m *MockFollowRepository) GetFollowingWithStatus(ctx context.Context, userI
 }
 
 // GetPendingRequests mock implementation.
-func (m *MockFollowRepository) GetPendingRequests(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetPendingRequests(ctx context.Context, userID string, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
+	var follows []*Follow
 	for _, follow := range m.Follows {
 		if follow.FolloweeID == userID && follow.Status == string(FollowStatusPending) {
 			follows = append(follows, follow)
@@ -734,24 +759,39 @@ func (m *MockFollowRepository) GetMutualFollows(ctx context.Context, userID1, us
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var ids []string
-	for _, follow1 := range m.Follows {
-		if follow1.FollowerID == userID1 && follow1.Status == string(FollowStatusAccepted) {
-			for _, follow2 := range m.Follows {
-				if follow2.FollowerID == userID2 && follow2.FolloweeID == follow1.FolloweeID &&
-					follow2.Status == string(FollowStatusAccepted) {
-					ids = append(ids, follow1.FolloweeID)
-					break
-				}
-			}
+	var mutual []string
+	// Get following of user1
+	following1 := make(map[string]bool)
+	for _, follow := range m.Follows {
+		if follow.FollowerID == userID1 && follow.Status == string(FollowStatusAccepted) {
+			following1[follow.FolloweeID] = true
 		}
 	}
-	return ids, "", nil
+	// Check user2's following
+	for _, follow := range m.Follows {
+		if follow.FollowerID == userID2 && follow.Status == string(FollowStatusAccepted) && following1[follow.FolloweeID] {
+			mutual = append(mutual, follow.FolloweeID)
+		}
+	}
+	return mutual, "", nil
 }
 
 // GetMutualFollowsDetailed mock implementation.
-func (m *MockFollowRepository) GetMutualFollowsDetailed(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]*entities.Follow, string, error) {
-	return []*entities.Follow{}, "", nil
+func (m *MockFollowRepository) GetMutualFollowsDetailed(ctx context.Context, userID1, userID2 string, cursor string, limit int) ([]*Follow, string, error) {
+	ids, _, err := m.GetMutualFollows(ctx, userID1, userID2, cursor, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	var follows []*Follow
+	for _, id := range ids {
+		for _, follow := range m.Follows {
+			if follow.FolloweeID == id {
+				follows = append(follows, follow)
+				break
+			}
+		}
+	}
+	return follows, "", nil
 }
 
 // GetMutualCountsForUsers mock implementation.
@@ -767,17 +807,102 @@ func (m *MockFollowRepository) GetMutualCountsForUsers(ctx context.Context, user
 	return result, nil
 }
 
+// GetFollowRecommendations mock implementation.
+func (m *MockFollowRepository) GetFollowRecommendations(ctx context.Context, userID string, limit int) ([]string, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	// Get users that followers of user are following
+	recommended := []string{}
+	// Get followers of user
+	var followers []string
+	for _, follow := range m.Follows {
+		if follow.FolloweeID == userID && follow.Status == string(FollowStatusAccepted) {
+			followers = append(followers, follow.FollowerID)
+		}
+	}
+	// Get who they follow
+	seen := make(map[string]bool)
+	seen[userID] = true
+	for _, fid := range followers {
+		for _, follow := range m.Follows {
+			if follow.FollowerID == fid && follow.Status == string(FollowStatusAccepted) && !seen[follow.FolloweeID] {
+				seen[follow.FolloweeID] = true
+				recommended = append(recommended, follow.FolloweeID)
+			}
+		}
+	}
+	if len(recommended) > limit {
+		recommended = recommended[:limit]
+	}
+	return recommended, nil
+}
+
+// GetFollowRecommendationsWithScore mock implementation.
+func (m *MockFollowRepository) GetFollowRecommendationsWithScore(ctx context.Context, userID string, limit int) ([]*FollowRecommendation, error) {
+	ids, err := m.GetFollowRecommendations(ctx, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	var recs []*FollowRecommendation
+	for _, id := range ids {
+		mutual, _ := m.CountMutual(ctx, userID, id)
+		followerCount, _ := m.CountFollowers(ctx, id)
+		recs = append(recs, &FollowRecommendation{
+			UserID:       id,
+			MutualCount:  mutual,
+			FollowerCount: followerCount,
+			Score:        float64(mutual)*2 + float64(followerCount)*0.5,
+		})
+	}
+	return recs, nil
+}
+
+// GetPeopleAlsoFollow mock implementation.
+func (m *MockFollowRepository) GetPeopleAlsoFollow(ctx context.Context, userID string, limit int) ([]string, error) {
+	return m.GetFollowRecommendations(ctx, userID, limit)
+}
+
+// GetPopularUsers mock implementation.
+func (m *MockFollowRepository) GetPopularUsers(ctx context.Context, limit int, excludeUserID string) ([]string, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	// Count followers for each user
+	userCounts := make(map[string]int64)
+	for _, follow := range m.Follows {
+		if follow.Status == string(FollowStatusAccepted) {
+			userCounts[follow.FolloweeID]++
+		}
+	}
+	// Sort by count
+	users := []string{}
+	for uid := range userCounts {
+		if uid != excludeUserID {
+			users = append(users, uid)
+		}
+	}
+	// Simple sort (bubble)
+	for i := 0; i < len(users); i++ {
+		for j := i + 1; j < len(users); j++ {
+			if userCounts[users[j]] > userCounts[users[i]] {
+				users[i], users[j] = users[j], users[i]
+			}
+		}
+	}
+	if len(users) > limit {
+		users = users[:limit]
+	}
+	return users, nil
+}
+
 // BulkCreate mock implementation.
-func (m *MockFollowRepository) BulkCreate(ctx context.Context, follows []*entities.Follow) error {
+func (m *MockFollowRepository) BulkCreate(ctx context.Context, follows []*Follow) error {
 	if m.Error != nil {
 		return m.Error
 	}
 	for _, follow := range follows {
-		m.Follows[follow.ID] = follow
-		if m.UserFollows[follow.FollowerID] == nil {
-			m.UserFollows[follow.FollowerID] = make(map[string]bool)
-		}
-		m.UserFollows[follow.FollowerID][follow.FolloweeID] = true
+		_ = m.Create(ctx, follow)
 	}
 	return nil
 }
@@ -788,14 +913,7 @@ func (m *MockFollowRepository) BulkDelete(ctx context.Context, followerIDs, foll
 		return m.Error
 	}
 	for i := range followerIDs {
-		for id, follow := range m.Follows {
-			if follow.FollowerID == followerIDs[i] && follow.FolloweeID == followeeIDs[i] {
-				delete(m.Follows, id)
-				if m.UserFollows[followerIDs[i]] != nil {
-					delete(m.UserFollows[followerIDs[i]], followeeIDs[i])
-				}
-			}
-		}
+		_ = m.Delete(ctx, followerIDs[i], followeeIDs[i])
 	}
 	return nil
 }
@@ -854,43 +972,9 @@ func (m *MockFollowRepository) BulkUpdateStatus(ctx context.Context, ids []strin
 		return m.Error
 	}
 	for _, id := range ids {
-		if follow, ok := m.Follows[id]; ok {
-			follow.Status = string(status)
-		}
+		_ = m.UpdateStatus(ctx, id, status)
 	}
 	return nil
-}
-
-// GetFollowRecommendations mock implementation.
-func (m *MockFollowRepository) GetFollowRecommendations(ctx context.Context, userID string, limit int) ([]string, error) {
-	if m.Error != nil {
-		return nil, m.Error
-	}
-	return []string{}, nil
-}
-
-// GetFollowRecommendationsWithScore mock implementation.
-func (m *MockFollowRepository) GetFollowRecommendationsWithScore(ctx context.Context, userID string, limit int) ([]*FollowRecommendation, error) {
-	if m.Error != nil {
-		return nil, m.Error
-	}
-	return []*FollowRecommendation{}, nil
-}
-
-// GetPeopleAlsoFollow mock implementation.
-func (m *MockFollowRepository) GetPeopleAlsoFollow(ctx context.Context, userID string, limit int) ([]string, error) {
-	if m.Error != nil {
-		return nil, m.Error
-	}
-	return []string{}, nil
-}
-
-// GetPopularUsers mock implementation.
-func (m *MockFollowRepository) GetPopularUsers(ctx context.Context, limit int, excludeUserID string) ([]string, error) {
-	if m.Error != nil {
-		return nil, m.Error
-	}
-	return []string{}, nil
 }
 
 // GetFollowStats mock implementation.
@@ -898,11 +982,20 @@ func (m *MockFollowRepository) GetFollowStats(ctx context.Context) (*FollowStats
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	return &FollowStats{
-		TotalFollows:    int64(len(m.Follows)),
-		UniqueFollowers: 0,
-		UniqueFollowees: 0,
-	}, nil
+	stats := &FollowStats{
+		TotalFollows: int64(len(m.Follows)),
+	}
+	uniqueFollowers := make(map[string]bool)
+	uniqueFollowees := make(map[string]bool)
+	for _, f := range m.Follows {
+		if f.Status == string(FollowStatusAccepted) {
+			uniqueFollowers[f.FollowerID] = true
+			uniqueFollowees[f.FolloweeID] = true
+		}
+	}
+	stats.UniqueFollowers = int64(len(uniqueFollowers))
+	stats.UniqueFollowees = int64(len(uniqueFollowees))
+	return stats, nil
 }
 
 // GetUserFollowStats mock implementation.
@@ -910,7 +1003,11 @@ func (m *MockFollowRepository) GetUserFollowStats(ctx context.Context, userID st
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	return m.GetFollowStats(ctx)
+	followers, _ := m.CountFollowers(ctx, userID)
+	following, _ := m.CountFollowing(ctx, userID)
+	return &FollowStats{
+		TotalFollows: followers + following,
+	}, nil
 }
 
 // GetDailyFollowStats mock implementation.
@@ -923,26 +1020,23 @@ func (m *MockFollowRepository) GetDailyFollowStats(ctx context.Context, start, e
 
 // GetFollowGrowthRate mock implementation.
 func (m *MockFollowRepository) GetFollowGrowthRate(ctx context.Context, userID string, days int) (float64, error) {
-	if m.Error != nil {
-		return 0, m.Error
-	}
 	return 0.0, nil
 }
 
 // GetTopFollowers mock implementation.
-func (m *MockFollowRepository) GetTopFollowers(ctx context.Context, limit int) ([]*entities.User, error) {
+func (m *MockFollowRepository) GetTopFollowers(ctx context.Context, limit int) ([]*User, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	return []*entities.User{}, nil
+	return []*User{}, nil
 }
 
 // GetTopFollowees mock implementation.
-func (m *MockFollowRepository) GetTopFollowees(ctx context.Context, limit int) ([]*entities.User, error) {
+func (m *MockFollowRepository) GetTopFollowees(ctx context.Context, limit int) ([]*User, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	return []*entities.User{}, nil
+	return []*User{}, nil
 }
 
 // GetFollowingIntersection mock implementation.
@@ -950,11 +1044,8 @@ func (m *MockFollowRepository) GetFollowingIntersection(ctx context.Context, use
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	// Get following of both users
 	following1, _ := m.GetFollowingIDs(ctx, userID1)
 	following2, _ := m.GetFollowingIDs(ctx, userID2)
-	
-	// Find intersection
 	set := make(map[string]bool)
 	for _, id := range following1 {
 		set[id] = true
@@ -975,7 +1066,6 @@ func (m *MockFollowRepository) GetFollowerIntersection(ctx context.Context, user
 	}
 	followers1, _ := m.GetFollowerIDs(ctx, userID1)
 	followers2, _ := m.GetFollowerIDs(ctx, userID2)
-	
 	set := make(map[string]bool)
 	for _, id := range followers1 {
 		set[id] = true
@@ -991,35 +1081,32 @@ func (m *MockFollowRepository) GetFollowerIntersection(ctx context.Context, user
 
 // GetFollowPaths mock implementation.
 func (m *MockFollowRepository) GetFollowPaths(ctx context.Context, userID1, userID2 string, maxDepth int) ([][]string, error) {
-	if m.Error != nil {
-		return nil, m.Error
-	}
 	return [][]string{}, nil
 }
 
 // GetFollowersByDateRange mock implementation.
-func (m *MockFollowRepository) GetFollowersByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowersByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
-	for _, follow := range m.Follows {
-		if follow.FolloweeID == userID && follow.CreatedAt.After(start) && follow.CreatedAt.Before(end) {
-			follows = append(follows, follow)
+	var follows []*Follow
+	for _, f := range m.Follows {
+		if f.FolloweeID == userID && f.CreatedAt.After(start) && f.CreatedAt.Before(end) {
+			follows = append(follows, f)
 		}
 	}
 	return follows, "", nil
 }
 
 // GetFollowingByDateRange mock implementation.
-func (m *MockFollowRepository) GetFollowingByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Follow, string, error) {
+func (m *MockFollowRepository) GetFollowingByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Follow, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var follows []*entities.Follow
-	for _, follow := range m.Follows {
-		if follow.FollowerID == userID && follow.CreatedAt.After(start) && follow.CreatedAt.Before(end) {
-			follows = append(follows, follow)
+	var follows []*Follow
+	for _, f := range m.Follows {
+		if f.FollowerID == userID && f.CreatedAt.After(start) && f.CreatedAt.Before(end) {
+			follows = append(follows, f)
 		}
 	}
 	return follows, "", nil
@@ -1059,9 +1146,12 @@ func (m *MockFollowRepository) CleanupExpired(ctx context.Context, before time.T
 		return 0, m.Error
 	}
 	count := int64(0)
-	for id, follow := range m.Follows {
-		if follow.CreatedAt.Before(before) && follow.Status == string(FollowStatusPending) {
+	for id, f := range m.Follows {
+		if f.CreatedAt.Before(before) && f.Status == string(FollowStatusPending) {
 			delete(m.Follows, id)
+			if m.UserFollows[f.FollowerID] != nil {
+				delete(m.UserFollows[f.FollowerID], f.FolloweeID)
+			}
 			count++
 		}
 	}
