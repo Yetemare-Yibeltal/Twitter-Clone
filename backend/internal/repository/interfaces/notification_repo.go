@@ -147,19 +147,19 @@ type NotificationRepository interface {
 	// --------------------------------------------------------------------
 
 	// Create creates a new notification.
-	Create(ctx context.Context, notification *entities.Notification) error
+	Create(ctx context.Context, notification *Notification) error
 
 	// GetByID retrieves a notification by its ID.
-	GetByID(ctx context.Context, id string) (*entities.Notification, error)
+	GetByID(ctx context.Context, id string) (*Notification, error)
 
 	// GetByUserAndType retrieves notifications by user and type.
-	GetByUserAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetByUserAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetByReferenceID retrieves notifications by reference ID.
-	GetByReferenceID(ctx context.Context, referenceID string) ([]*entities.Notification, error)
+	GetByReferenceID(ctx context.Context, referenceID string) ([]*Notification, error)
 
 	// Update updates a notification (e.g., read status).
-	Update(ctx context.Context, notification *entities.Notification) error
+	Update(ctx context.Context, notification *Notification) error
 
 	// Delete removes a notification.
 	Delete(ctx context.Context, id string) error
@@ -226,22 +226,22 @@ type NotificationRepository interface {
 	// --------------------------------------------------------------------
 
 	// GetByUserID returns notifications for a user with pagination.
-	GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetUnreadByUserID returns unread notifications for a user.
-	GetUnreadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetUnreadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetReadByUserID returns read notifications for a user.
-	GetReadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetReadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetByFromUserID returns notifications from a specific sender.
-	GetByFromUserID(ctx context.Context, fromUserID string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetByFromUserID(ctx context.Context, fromUserID string, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetRecentByUserID returns recent notifications for a user.
-	GetRecentByUserID(ctx context.Context, userID string, limit int) ([]*entities.Notification, error)
+	GetRecentByUserID(ctx context.Context, userID string, limit int) ([]*Notification, error)
 
 	// GetByUserIDAndType returns notifications by user and type.
-	GetByUserIDAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetByUserIDAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*Notification, string, error)
 
 	// --------------------------------------------------------------------
 	// Grouped Notifications
@@ -264,23 +264,23 @@ type NotificationRepository interface {
 	// --------------------------------------------------------------------
 
 	// GetNotificationsByDateRange returns notifications within a date range.
-	GetNotificationsByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetNotificationsByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetUnreadByDateRange returns unread notifications within a date range.
-	GetUnreadByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Notification, string, error)
+	GetUnreadByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Notification, string, error)
 
 	// GetNotificationsByReferenceIDAndType returns notifications by reference and type.
-	GetNotificationsByReferenceIDAndType(ctx context.Context, referenceID, notificationType string) ([]*entities.Notification, error)
+	GetNotificationsByReferenceIDAndType(ctx context.Context, referenceID, notificationType string) ([]*Notification, error)
 
 	// GetNotificationsByMultipleReferences returns notifications for multiple references.
-	GetNotificationsByMultipleReferences(ctx context.Context, referenceIDs []string) ([]*entities.Notification, error)
+	GetNotificationsByMultipleReferences(ctx context.Context, referenceIDs []string) ([]*Notification, error)
 
 	// --------------------------------------------------------------------
 	// Bulk Operations
 	// --------------------------------------------------------------------
 
 	// BulkCreate inserts multiple notifications in a single transaction.
-	BulkCreate(ctx context.Context, notifications []*entities.Notification) error
+	BulkCreate(ctx context.Context, notifications []*Notification) error
 
 	// BulkDelete removes multiple notifications in a single transaction.
 	BulkDelete(ctx context.Context, ids []string) error
@@ -359,6 +359,21 @@ type NotificationRepository interface {
 // Supporting Types
 // ======================================================================
 
+// Notification represents a notification (used by repository).
+type Notification struct {
+	ID          string               `db:"id" json:"id"`
+	UserID      string               `db:"user_id" json:"user_id"`
+	FromUserID  string               `db:"from_user_id" json:"from_user_id,omitempty"`
+	Type        string               `db:"type" json:"type"`
+	ReferenceID string               `db:"reference_id" json:"reference_id,omitempty"`
+	Read        bool                 `db:"read" json:"read"`
+	ReadAt      *time.Time           `db:"read_at" json:"read_at,omitempty"`
+	Metadata    map[string]interface{} `db:"metadata" json:"metadata,omitempty"`
+	CreatedAt   time.Time            `db:"created_at" json:"created_at"`
+	UpdatedAt   time.Time            `db:"updated_at" json:"updated_at"`
+	DeletedAt   *time.Time           `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
 // NotificationTypeStat represents notification statistics by type.
 type NotificationTypeStat struct {
 	Type        string    `json:"type"`
@@ -403,7 +418,7 @@ func IsNotificationError(err error) bool {
 
 // MockNotificationRepository is a mock implementation for testing.
 type MockNotificationRepository struct {
-	Notifications map[string]*entities.Notification
+	Notifications map[string]*Notification
 	UserNotifications map[string][]string // userID -> notification IDs
 	Error        error
 	NextCursor   string
@@ -412,13 +427,13 @@ type MockNotificationRepository struct {
 // NewMockNotificationRepo creates a new mock repository.
 func NewMockNotificationRepo() NotificationRepository {
 	return &MockNotificationRepository{
-		Notifications: make(map[string]*entities.Notification),
+		Notifications: make(map[string]*Notification),
 		UserNotifications: make(map[string][]string),
 	}
 }
 
 // Create mock implementation.
-func (m *MockNotificationRepository) Create(ctx context.Context, notification *entities.Notification) error {
+func (m *MockNotificationRepository) Create(ctx context.Context, notification *Notification) error {
 	if m.Error != nil {
 		return m.Error
 	}
@@ -431,7 +446,7 @@ func (m *MockNotificationRepository) Create(ctx context.Context, notification *e
 }
 
 // GetByID mock implementation.
-func (m *MockNotificationRepository) GetByID(ctx context.Context, id string) (*entities.Notification, error) {
+func (m *MockNotificationRepository) GetByID(ctx context.Context, id string) (*Notification, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
@@ -442,11 +457,11 @@ func (m *MockNotificationRepository) GetByID(ctx context.Context, id string) (*e
 }
 
 // GetByUserAndType mock implementation.
-func (m *MockNotificationRepository) GetByUserAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetByUserAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && n.Type == notificationType {
 			notifications = append(notifications, n)
@@ -456,11 +471,11 @@ func (m *MockNotificationRepository) GetByUserAndType(ctx context.Context, userI
 }
 
 // GetByReferenceID mock implementation.
-func (m *MockNotificationRepository) GetByReferenceID(ctx context.Context, referenceID string) ([]*entities.Notification, error) {
+func (m *MockNotificationRepository) GetByReferenceID(ctx context.Context, referenceID string) ([]*Notification, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, n := range m.Notifications {
 		if n.ReferenceID == referenceID {
 			notifications = append(notifications, n)
@@ -470,7 +485,7 @@ func (m *MockNotificationRepository) GetByReferenceID(ctx context.Context, refer
 }
 
 // Update mock implementation.
-func (m *MockNotificationRepository) Update(ctx context.Context, notification *entities.Notification) error {
+func (m *MockNotificationRepository) Update(ctx context.Context, notification *Notification) error {
 	if m.Error != nil {
 		return m.Error
 	}
@@ -488,7 +503,6 @@ func (m *MockNotificationRepository) Delete(ctx context.Context, id string) erro
 	}
 	if notification, ok := m.Notifications[id]; ok {
 		delete(m.Notifications, id)
-		// Remove from user list
 		if userNotifs, ok := m.UserNotifications[notification.UserID]; ok {
 			for i, nid := range userNotifs {
 				if nid == id {
@@ -706,11 +720,11 @@ func (m *MockNotificationRepository) CountUnreadByUserIDs(ctx context.Context, u
 }
 
 // GetByUserID mock implementation.
-func (m *MockNotificationRepository) GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok {
 			notifications = append(notifications, n)
@@ -720,11 +734,11 @@ func (m *MockNotificationRepository) GetByUserID(ctx context.Context, userID str
 }
 
 // GetUnreadByUserID mock implementation.
-func (m *MockNotificationRepository) GetUnreadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetUnreadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && !n.Read {
 			notifications = append(notifications, n)
@@ -734,11 +748,11 @@ func (m *MockNotificationRepository) GetUnreadByUserID(ctx context.Context, user
 }
 
 // GetReadByUserID mock implementation.
-func (m *MockNotificationRepository) GetReadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetReadByUserID(ctx context.Context, userID string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && n.Read {
 			notifications = append(notifications, n)
@@ -748,11 +762,11 @@ func (m *MockNotificationRepository) GetReadByUserID(ctx context.Context, userID
 }
 
 // GetByFromUserID mock implementation.
-func (m *MockNotificationRepository) GetByFromUserID(ctx context.Context, fromUserID string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetByFromUserID(ctx context.Context, fromUserID string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, n := range m.Notifications {
 		if n.FromUserID == fromUserID {
 			notifications = append(notifications, n)
@@ -762,11 +776,11 @@ func (m *MockNotificationRepository) GetByFromUserID(ctx context.Context, fromUs
 }
 
 // GetRecentByUserID mock implementation.
-func (m *MockNotificationRepository) GetRecentByUserID(ctx context.Context, userID string, limit int) ([]*entities.Notification, error) {
+func (m *MockNotificationRepository) GetRecentByUserID(ctx context.Context, userID string, limit int) ([]*Notification, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok {
 			notifications = append(notifications, n)
@@ -776,11 +790,11 @@ func (m *MockNotificationRepository) GetRecentByUserID(ctx context.Context, user
 }
 
 // GetByUserIDAndType mock implementation.
-func (m *MockNotificationRepository) GetByUserIDAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetByUserIDAndType(ctx context.Context, userID, notificationType string, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && n.Type == notificationType {
 			notifications = append(notifications, n)
@@ -823,11 +837,11 @@ func (m *MockNotificationRepository) GetGroupedCount(ctx context.Context, userID
 }
 
 // GetNotificationsByDateRange mock implementation.
-func (m *MockNotificationRepository) GetNotificationsByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetNotificationsByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && n.CreatedAt.After(start) && n.CreatedAt.Before(end) {
 			notifications = append(notifications, n)
@@ -837,11 +851,11 @@ func (m *MockNotificationRepository) GetNotificationsByDateRange(ctx context.Con
 }
 
 // GetUnreadByDateRange mock implementation.
-func (m *MockNotificationRepository) GetUnreadByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*entities.Notification, string, error) {
+func (m *MockNotificationRepository) GetUnreadByDateRange(ctx context.Context, userID string, start, end time.Time, cursor string, limit int) ([]*Notification, string, error) {
 	if m.Error != nil {
 		return nil, "", m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, id := range m.UserNotifications[userID] {
 		if n, ok := m.Notifications[id]; ok && !n.Read && n.CreatedAt.After(start) && n.CreatedAt.Before(end) {
 			notifications = append(notifications, n)
@@ -851,11 +865,11 @@ func (m *MockNotificationRepository) GetUnreadByDateRange(ctx context.Context, u
 }
 
 // GetNotificationsByReferenceIDAndType mock implementation.
-func (m *MockNotificationRepository) GetNotificationsByReferenceIDAndType(ctx context.Context, referenceID, notificationType string) ([]*entities.Notification, error) {
+func (m *MockNotificationRepository) GetNotificationsByReferenceIDAndType(ctx context.Context, referenceID, notificationType string) ([]*Notification, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, n := range m.Notifications {
 		if n.ReferenceID == referenceID && n.Type == notificationType {
 			notifications = append(notifications, n)
@@ -865,11 +879,11 @@ func (m *MockNotificationRepository) GetNotificationsByReferenceIDAndType(ctx co
 }
 
 // GetNotificationsByMultipleReferences mock implementation.
-func (m *MockNotificationRepository) GetNotificationsByMultipleReferences(ctx context.Context, referenceIDs []string) ([]*entities.Notification, error) {
+func (m *MockNotificationRepository) GetNotificationsByMultipleReferences(ctx context.Context, referenceIDs []string) ([]*Notification, error) {
 	if m.Error != nil {
 		return nil, m.Error
 	}
-	var notifications []*entities.Notification
+	var notifications []*Notification
 	for _, n := range m.Notifications {
 		for _, ref := range referenceIDs {
 			if n.ReferenceID == ref {
@@ -882,7 +896,7 @@ func (m *MockNotificationRepository) GetNotificationsByMultipleReferences(ctx co
 }
 
 // BulkCreate mock implementation.
-func (m *MockNotificationRepository) BulkCreate(ctx context.Context, notifications []*entities.Notification) error {
+func (m *MockNotificationRepository) BulkCreate(ctx context.Context, notifications []*Notification) error {
 	if m.Error != nil {
 		return m.Error
 	}
