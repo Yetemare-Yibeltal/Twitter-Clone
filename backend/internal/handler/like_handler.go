@@ -42,53 +42,10 @@ func NewLikeHandler(
 }
 
 // ======================================================================
-// Toggle Like
+// Like/Unlike
 // ======================================================================
 
-// ToggleLike handles liking/unliking a tweet.
-// @Summary Toggle like on tweet
-// @Description Likes or unlikes a tweet (toggles)
-// @Tags likes
-// @Security BearerAuth
-// @Param id path string true "Tweet ID"
-// @Success 200 {object} dto.LikeResponse
-// @Failure 400 {object} dto.ErrorResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 404 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/likes/{id}/toggle [post]
-func (h *LikeHandler) ToggleLike(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	vars := mux.Vars(r)
-	tweetID := vars["id"]
-	if tweetID == "" {
-		h.sendError(w, http.StatusBadRequest, "Tweet ID required", nil)
-		return
-	}
-
-	result, err := h.likeService.ToggleLike(r.Context(), userID, tweetID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to toggle like")
-		return
-	}
-
-	// Get updated like count
-	count, _ := h.likeService.GetLikeCount(r.Context(), tweetID)
-
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"liked":       result.Liked,
-		"like_count":  count,
-		"tweet_id":    tweetID,
-		"timestamp":   time.Now().Unix(),
-	})
-}
-
-// LikeTweet handles explicitly liking a tweet.
+// LikeTweet handles liking a tweet.
 // @Summary Like a tweet
 // @Description Likes a tweet
 // @Tags likes
@@ -124,20 +81,22 @@ func (h *LikeHandler) LikeTweet(w http.ResponseWriter, r *http.Request) {
 	// Get updated like count
 	count, _ := h.likeService.GetLikeCount(r.Context(), tweetID)
 
-	// Create notification for tweet owner (if not self-like)
+	// Create notification for tweet owner if not self-like
 	tweet, err := h.tweetService.GetTweetByID(r.Context(), tweetID)
 	if err == nil && tweet.UserID != userID {
-		// Notification creation handled by service
+		// Notification handled by service
 	}
 
 	h.sendSuccess(w, http.StatusCreated, map[string]interface{}{
 		"liked":       result.Liked,
+		"like_id":     result.ID,
 		"like_count":  count,
 		"tweet_id":    tweetID,
+		"timestamp":   time.Now().Unix(),
 	})
 }
 
-// UnlikeTweet handles explicitly unliking a tweet.
+// UnlikeTweet handles unliking a tweet.
 // @Summary Unlike a tweet
 // @Description Unlikes a tweet
 // @Tags likes
@@ -174,8 +133,67 @@ func (h *LikeHandler) UnlikeTweet(w http.ResponseWriter, r *http.Request) {
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"liked":       result.Liked,
+		"like_id":     result.ID,
 		"like_count":  count,
 		"tweet_id":    tweetID,
+		"timestamp":   time.Now().Unix(),
+	})
+}
+
+// ToggleLike handles toggling like status on a tweet.
+// @Summary Toggle like
+// @Description Toggles like status on a tweet
+// @Tags likes
+// @Security BearerAuth
+// @Param id path string true "Tweet ID"
+// @Success 200 {object} dto.LikeResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/likes/{id}/toggle [post]
+func (h *LikeHandler) ToggleLike(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	vars := mux.Vars(r)
+	tweetID := vars["id"]
+	if tweetID == "" {
+		h.sendError(w, http.StatusBadRequest, "Tweet ID required", nil)
+		return
+	}
+
+	// Check if already liked
+	isLiked, err := h.likeService.IsLiked(r.Context(), userID, tweetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to check like status")
+		return
+	}
+
+	var result *dto.LikeResponse
+	if isLiked {
+		result, err = h.likeService.UnlikeTweet(r.Context(), userID, tweetID)
+	} else {
+		result, err = h.likeService.LikeTweet(r.Context(), userID, tweetID)
+	}
+
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to toggle like")
+		return
+	}
+
+	// Get updated like count
+	count, _ := h.likeService.GetLikeCount(r.Context(), tweetID)
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"liked":       result.Liked,
+		"like_id":     result.ID,
+		"like_count":  count,
+		"tweet_id":    tweetID,
+		"timestamp":   time.Now().Unix(),
 	})
 }
 
@@ -247,6 +265,13 @@ func (h *LikeHandler) GetLikeCount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify tweet exists
+	_, err := h.tweetService.GetTweetByID(r.Context(), tweetID)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "Tweet not found", nil)
+		return
+	}
+
 	count, err := h.likeService.GetLikeCount(r.Context(), tweetID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get like count")
@@ -259,7 +284,11 @@ func (h *LikeHandler) GetLikeCount(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetLikesForTweets handles retrieving like counts for multiple tweets (bulk).
+// ======================================================================
+= Get Likes for Tweets (Bulk)
+// ======================================================================
+
+// GetLikesForTweets handles retrieving like counts for multiple tweets.
 // @Summary Get like counts for multiple tweets
 // @Description Retrieves like counts for a list of tweet IDs
 // @Tags likes
@@ -342,7 +371,7 @@ func (h *LikeHandler) GetLikers(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Liked Tweets (User's likes)
+= Get Liked Tweets
 // ======================================================================
 
 // GetLikedTweets handles retrieving tweets liked by the authenticated user.
@@ -385,6 +414,10 @@ func (h *LikeHandler) GetLikedTweets(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ======================================================================
+= Get Liked Tweet IDs
+// ======================================================================
+
 // GetLikedTweetIDs handles retrieving only the IDs of tweets liked by the user.
 // @Summary Get liked tweet IDs
 // @Description Retrieves only the IDs of tweets liked by the user
@@ -415,7 +448,7 @@ func (h *LikeHandler) GetLikedTweetIDs(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Like Status for Multiple Tweets (Bulk)
+= Get Like Statuses (Bulk)
 // ======================================================================
 
 // GetLikeStatuses handles retrieving like statuses for multiple tweets.
@@ -461,7 +494,7 @@ func (h *LikeHandler) GetLikeStatuses(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Like Stats (User)
+= Get User Like Stats
 // ======================================================================
 
 // GetUserLikeStats handles retrieving like statistics for the user.
@@ -491,7 +524,7 @@ func (h *LikeHandler) GetUserLikeStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Most Liked Tweets (Trending)
+= Get Most Liked Tweets
 // ======================================================================
 
 // GetMostLikedTweets handles retrieving the most liked tweets.
@@ -576,8 +609,33 @@ func (h *LikeHandler) AdminListLikes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build response
+	likeResponses := make([]*dto.LikeAdminResponse, 0, len(likes))
+	for _, l := range likes {
+		user, _ := h.userService.GetUserByID(r.Context(), l.UserID)
+		tweet, _ := h.tweetService.GetTweetByID(r.Context(), l.TweetID)
+		likeResponses = append(likeResponses, &dto.LikeAdminResponse{
+			ID:           l.ID,
+			UserID:       l.UserID,
+			TweetID:      l.TweetID,
+			Username: func() string {
+				if user != nil {
+					return user.Username
+				}
+				return ""
+			}(),
+			TweetContent: func() string {
+				if tweet != nil {
+					return tweet.Content
+				}
+				return ""
+			}(),
+			CreatedAt: l.CreatedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        likes,
+		"data":        likeResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -701,6 +759,8 @@ func (h *LikeHandler) handleServiceError(w http.ResponseWriter, err error, defau
 		h.sendError(w, http.StatusBadRequest, "Invalid like ID", nil)
 	case errors.Is(err, service.ErrLikeDisabled):
 		h.sendError(w, http.StatusBadRequest, "Liking is disabled for this tweet", nil)
+	case errors.Is(err, service.ErrInvalidUserID):
+		h.sendError(w, http.StatusBadRequest, "Invalid user ID", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
