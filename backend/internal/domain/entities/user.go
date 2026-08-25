@@ -2,186 +2,305 @@
 package entities
 
 import (
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// UserRole defines the role of a user.
-type UserRole string
+// ======================================================================
+// Constants
+// ======================================================================
 
 const (
-	RoleUser      UserRole = "user"
-	RoleModerator UserRole = "moderator"
-	RoleAdmin     UserRole = "admin"
+	// User statuses
+	UserStatusActive    = "active"
+	UserStatusInactive  = "inactive"
+	UserStatusSuspended = "suspended"
+	UserStatusDeleted   = "deleted"
+	
+	// User roles
+	UserRoleUser      = "user"
+	UserRoleModerator = "moderator"
+	UserRoleAdmin     = "admin"
+	
+	// Validation limits
+	MinUsernameLength = 3
+	MaxUsernameLength = 20
+	MinPasswordLength = 8
+	MaxPasswordLength = 72
+	MaxFullNameLength = 100
+	MaxBioLength      = 160
+	MaxEmailLength    = 254
 )
 
-// UserStatus represents the current status of a user.
-type UserStatus string
+// ======================================================================
+// Errors
+// ======================================================================
 
-const (
-	StatusActive    UserStatus = "active"
-	StatusInactive  UserStatus = "inactive"
-	StatusSuspended UserStatus = "suspended"
-	StatusDeleted   UserStatus = "deleted"
-)
-
-// Common validation errors.
 var (
-	ErrEmptyUsername      = errors.New("username cannot be empty")
-	ErrInvalidUsername    = errors.New("username must be 3-20 characters, alphanumeric, underscore, or dot")
-	ErrEmptyEmail         = errors.New("email cannot be empty")
-	ErrInvalidEmail       = errors.New("invalid email format")
-	ErrEmptyPassword      = errors.New("password cannot be empty")
-	ErrWeakPassword       = errors.New("password must be at least 8 characters with a mix of letters, numbers, and symbols")
-	ErrEmptyFullName      = errors.New("full name cannot be empty")
-	ErrBioTooLong         = errors.New("bio must not exceed 160 characters")
-	ErrInvalidRole        = errors.New("invalid role")
-	ErrInvalidStatus      = errors.New("invalid status")
-	ErrUserAlreadyDeleted = errors.New("user already deleted")
-	ErrUserSuspended      = errors.New("user is suspended")
-	ErrUserInactive       = errors.New("user is inactive")
+	ErrUserIDEmpty           = errors.New("user ID cannot be empty")
+	ErrUsernameEmpty         = errors.New("username cannot be empty")
+	ErrUsernameTooShort      = fmt.Errorf("username must be at least %d characters", MinUsernameLength)
+	ErrUsernameTooLong       = fmt.Errorf("username must be at most %d characters", MaxUsernameLength)
+	ErrUsernameInvalid       = errors.New("username contains invalid characters")
+	ErrUsernameReserved      = errors.New("username is reserved")
+	ErrEmailEmpty            = errors.New("email cannot be empty")
+	ErrEmailInvalid          = errors.New("invalid email format")
+	ErrEmailTooLong          = fmt.Errorf("email exceeds maximum length of %d characters", MaxEmailLength)
+	ErrPasswordEmpty         = errors.New("password cannot be empty")
+	ErrPasswordTooShort      = fmt.Errorf("password must be at least %d characters", MinPasswordLength)
+	ErrPasswordTooLong       = fmt.Errorf("password must be at most %d characters", MaxPasswordLength)
+	ErrPasswordWeak          = errors.New("password is too weak: must contain uppercase, lowercase, number, and special character")
+	ErrFullNameEmpty         = errors.New("full name cannot be empty")
+	ErrFullNameTooLong       = fmt.Errorf("full name exceeds maximum length of %d characters", MaxFullNameLength)
+	ErrBioTooLong            = fmt.Errorf("bio exceeds maximum length of %d characters", MaxBioLength)
+	ErrInvalidRole           = errors.New("invalid user role")
+	ErrInvalidStatus         = errors.New("invalid user status")
+	ErrUserAlreadyDeleted    = errors.New("user already deleted")
+	ErrUserNotDeleted        = errors.New("user is not deleted")
+	ErrUserSuspended         = errors.New("user is suspended")
+	ErrUserInactive          = errors.New("user is inactive")
+	ErrUserAlreadyActive     = errors.New("user is already active")
+	ErrUserAlreadySuspended  = errors.New("user is already suspended")
 )
 
-// User represents the core domain entity for a user.
+// ======================================================================
+// User Entity
+// ======================================================================
+
+// User represents a user in the system.
 type User struct {
-	// Primary identifiers
-	ID        string    `db:"id" json:"id"`
-	Username  string    `db:"username" json:"username"`
-	Email     string    `db:"email" json:"email"`
-	Password  string    `db:"-" json:"-"`                // plain-text password (not stored)
-	PasswordHash string `db:"password_hash" json:"-"`    // hashed password stored in DB
-
-	// Profile fields
-	FullName  string `db:"full_name" json:"full_name"`
-	Bio       string `db:"bio" json:"bio"`
-	AvatarURL string `db:"avatar_url" json:"avatar_url"`
-
-	// Flags
-	IsVerified  bool `db:"is_verified" json:"is_verified"`
-	IsSuspended bool `db:"is_suspended" json:"is_suspended"`
-	IsActive    bool `db:"is_active" json:"is_active"`
-
-	// Role
-	Role UserRole `db:"role" json:"role"`
-
-	// Counters (denormalized)
-	TweetCount     int64 `db:"tweet_count" json:"tweet_count"`
-	FollowerCount  int64 `db:"follower_count" json:"follower_count"`
-	FollowingCount int64 `db:"following_count" json:"following_count"`
-
-	// Timestamps
-	LastActive *time.Time `db:"last_active" json:"last_active"`
-	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt  time.Time  `db:"updated_at" json:"updated_at"`
-	DeletedAt  *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
-
-	// Suspension reason
-	SuspendedReason string `db:"suspended_reason" json:"suspended_reason,omitempty"`
+	ID              string     `db:"id" json:"id"`
+	Username        string     `db:"username" json:"username"`
+	Email           string     `db:"email" json:"email"`
+	PasswordHash    string     `db:"password_hash" json:"-"`
+	FullName        string     `db:"full_name" json:"full_name"`
+	Bio             string     `db:"bio" json:"bio,omitempty"`
+	AvatarURL       string     `db:"avatar_url" json:"avatar_url,omitempty"`
+	BannerURL       string     `db:"banner_url" json:"banner_url,omitempty"`
+	Location        string     `db:"location" json:"location,omitempty"`
+	Website         string     `db:"website" json:"website,omitempty"`
+	Role            string     `db:"role" json:"role"`
+	Status          string     `db:"status" json:"status"`
+	IsVerified      bool       `db:"is_verified" json:"is_verified"`
+	IsPrivate       bool       `db:"is_private" json:"is_private"`
+	TwitterHandle   string     `db:"twitter_handle" json:"twitter_handle,omitempty"`
+	InstagramHandle string     `db:"instagram_handle" json:"instagram_handle,omitempty"`
+	JoinedAt        time.Time  `db:"joined_at" json:"joined_at"`
+	LastActiveAt    *time.Time `db:"last_active_at" json:"last_active_at,omitempty"`
+	DeletedAt       *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+	Metadata        UserMetadata `db:"metadata" json:"metadata,omitempty"`
 }
 
-// NewUser creates a new User instance with default values and validation.
+// UserMetadata holds optional user metadata.
+type UserMetadata struct {
+	Theme        string            `json:"theme,omitempty"`
+	Language     string            `json:"language,omitempty"`
+	Timezone     string            `json:"timezone,omitempty"`
+	Notifications map[string]bool  `json:"notifications,omitempty"`
+	Privacy      map[string]bool   `json:"privacy,omitempty"`
+	CustomFields map[string]string `json:"custom_fields,omitempty"`
+}
+
+// Value implements driver.Valuer for JSON storage.
+func (m UserMetadata) Value() (driver.Value, error) {
+	return json.Marshal(m)
+}
+
+// Scan implements sql.Scanner for JSON retrieval.
+func (m *UserMetadata) Scan(value interface{}) error {
+	if value == nil {
+		*m = UserMetadata{}
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported type for UserMetadata: %T", value)
+	}
+	return json.Unmarshal(bytes, m)
+}
+
+// ======================================================================
+// Factory Methods
+// ======================================================================
+
+// NewUser creates a new user with default values.
 func NewUser(username, email, password, fullName string) (*User, error) {
-	user := &User{
-		Username:  username,
-		Email:     email,
-		Password:  password,
-		FullName:  fullName,
-		IsActive:  true,
+	u := &User{
+		ID:         uuid.New().String(),
+		Username:   username,
+		Email:      email,
+		FullName:   fullName,
+		Role:       UserRoleUser,
+		Status:     UserStatusActive,
 		IsVerified: false,
-		IsSuspended: false,
-		Role:      RoleUser,
-		TweetCount: 0,
-		FollowerCount: 0,
-		FollowingCount: 0,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		IsPrivate:  false,
+		JoinedAt:   time.Now(),
+		Metadata:   UserMetadata{},
 	}
-	if err := user.Validate(); err != nil {
+	if err := u.SetPassword(password); err != nil {
 		return nil, err
 	}
-	if err := user.HashPassword(); err != nil {
+	if err := u.Validate(); err != nil {
 		return nil, err
 	}
-	return user, nil
+	return u, nil
 }
 
-// Validate checks all fields for correctness.
+// MustNewUser creates a new user and panics on error.
+func MustNewUser(username, email, password, fullName string) *User {
+	u, err := NewUser(username, email, password, fullName)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+// ======================================================================
+// Validation
+// ======================================================================
+
+// Validate performs comprehensive validation.
 func (u *User) Validate() error {
-	// Validate username
-	if strings.TrimSpace(u.Username) == "" {
-		return ErrEmptyUsername
+	if strings.TrimSpace(u.ID) == "" {
+		return ErrUserIDEmpty
 	}
-	usernameRegex := regexp.MustCompile(`^[a-zA-Z0-9_.]{3,20}$`)
-	if !usernameRegex.MatchString(u.Username) {
-		return ErrInvalidUsername
+	// Username validation
+	usernameTrimmed := strings.TrimSpace(u.Username)
+	if usernameTrimmed == "" {
+		return ErrUsernameEmpty
 	}
-
-	// Validate email
-	if strings.TrimSpace(u.Email) == "" {
-		return ErrEmptyEmail
+	if len(usernameTrimmed) < MinUsernameLength {
+		return ErrUsernameTooShort
 	}
-	if !isValidEmail(u.Email) {
-		return ErrInvalidEmail
+	if len(usernameTrimmed) > MaxUsernameLength {
+		return ErrUsernameTooLong
 	}
-
-	// Validate password (only if set, not hashed)
-	if u.Password != "" {
-		if len(u.Password) < 8 {
-			return ErrWeakPassword
-		}
-		// Check for at least one letter, one number, and one symbol
-		hasLetter := regexp.MustCompile(`[a-zA-Z]`).MatchString(u.Password)
-		hasNumber := regexp.MustCompile(`[0-9]`).MatchString(u.Password)
-		hasSymbol := regexp.MustCompile(`[!@#$%^&*()_+\-=\[\]{};:'",.<>/?]`).MatchString(u.Password)
-		if !hasLetter || !hasNumber || !hasSymbol {
-			return ErrWeakPassword
-		}
+	if !isValidUsername(usernameTrimmed) {
+		return ErrUsernameInvalid
 	}
-
-	// Validate full name
-	if strings.TrimSpace(u.FullName) == "" {
-		return ErrEmptyFullName
+	if isReservedUsername(usernameTrimmed) {
+		return ErrUsernameReserved
 	}
-
-	// Validate bio length
-	if len(u.Bio) > 160 {
+	u.Username = strings.ToLower(usernameTrimmed)
+	// Email validation
+	emailTrimmed := strings.TrimSpace(u.Email)
+	if emailTrimmed == "" {
+		return ErrEmailEmpty
+	}
+	if len(emailTrimmed) > MaxEmailLength {
+		return ErrEmailTooLong
+	}
+	if !isValidEmail(emailTrimmed) {
+		return ErrEmailInvalid
+	}
+	u.Email = strings.ToLower(emailTrimmed)
+	// Full name validation
+	fullNameTrimmed := strings.TrimSpace(u.FullName)
+	if fullNameTrimmed == "" {
+		return ErrFullNameEmpty
+	}
+	if len(fullNameTrimmed) > MaxFullNameLength {
+		return ErrFullNameTooLong
+	}
+	u.FullName = fullNameTrimmed
+	// Bio validation
+	if len(u.Bio) > MaxBioLength {
 		return ErrBioTooLong
 	}
-
-	// Validate role
-	if u.Role != RoleUser && u.Role != RoleModerator && u.Role != RoleAdmin {
+	u.Bio = strings.TrimSpace(u.Bio)
+	// Role validation
+	if !isValidRole(u.Role) {
 		return ErrInvalidRole
 	}
-
-	// Validate status flags consistency
-	if u.IsSuspended && u.IsActive {
-		return errors.New("user cannot be both suspended and active")
+	// Status validation
+	if !isValidStatus(u.Status) {
+		return ErrInvalidStatus
 	}
-	if u.DeletedAt != nil && u.IsActive {
-		return errors.New("deleted user cannot be active")
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
 	}
-
 	return nil
 }
 
-// isValidEmail validates email format using regex.
+// isValidUsername checks if a username contains only allowed characters.
+func isValidUsername(username string) bool {
+	re := regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+	return re.MatchString(username)
+}
+
+// isValidEmail checks if an email is valid.
 func isValidEmail(email string) bool {
-	// Basic email regex (RFC 5322 simplified)
 	re := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
 	return re.MatchString(email)
 }
 
-// HashPassword hashes the plain-text password and stores it in PasswordHash.
-func (u *User) HashPassword() error {
-	if u.Password == "" {
-		return nil // allow empty if not provided (e.g., during updates)
+// isValidRole checks if a role is valid.
+func isValidRole(role string) bool {
+	switch role {
+	case UserRoleUser, UserRoleModerator, UserRoleAdmin:
+		return true
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
+	return false
+}
+
+// isValidStatus checks if a status is valid.
+func isValidStatus(status string) bool {
+	switch status {
+	case UserStatusActive, UserStatusInactive, UserStatusSuspended, UserStatusDeleted:
+		return true
+	}
+	return false
+}
+
+// isReservedUsername checks if a username is reserved.
+func isReservedUsername(username string) bool {
+	reserved := map[string]bool{
+		"admin": true, "administrator": true, "root": true,
+		"system": true, "support": true, "help": true,
+		"info": true, "noreply": true, "postmaster": true,
+		"webmaster": true, "hostmaster": true, "abuse": true,
+		"security": true, "privacy": true, "moderator": true,
+		"mod": true, "owner": true, "manager": true,
+		"user": true, "users": true, "guest": true,
+		"test": true, "testing": true, "demo": true,
+		"example": true, "sample": true, "anonymous": true,
+		"default": true, "null": true, "undefined": true,
+	}
+	return reserved[strings.ToLower(username)]
+}
+
+// ======================================================================
+// Password Management
+// ======================================================================
+
+// SetPassword hashes and sets the user's password.
+func (u *User) SetPassword(password string) error {
+	if password == "" {
+		return ErrPasswordEmpty
+	}
+	if len(password) < MinPasswordLength {
+		return ErrPasswordTooShort
+	}
+	if len(password) > MaxPasswordLength {
+		return ErrPasswordTooLong
+	}
+	if !isStrongPassword(password) {
+		return ErrPasswordWeak
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return fmt.Errorf("failed to hash password: %w", err)
 	}
@@ -189,250 +308,317 @@ func (u *User) HashPassword() error {
 	return nil
 }
 
-// CheckPassword compares a plain-text password with the stored hash.
+// CheckPassword verifies the provided password against the stored hash.
 func (u *User) CheckPassword(password string) bool {
+	if u.PasswordHash == "" {
+		return false
+	}
 	err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password))
 	return err == nil
 }
 
-// ChangePassword updates the user's password after validation.
-func (u *User) ChangePassword(newPassword string) error {
+// NeedsRehash checks if the password hash needs rehashing (e.g., cost changed).
+func (u *User) NeedsRehash() bool {
+	cost, err := bcrypt.Cost([]byte(u.PasswordHash))
+	if err != nil {
+		return true
+	}
+	return cost < bcrypt.DefaultCost
+}
+
+// isStrongPassword checks if a password meets complexity requirements.
+func isStrongPassword(password string) bool {
+	hasUpper := regexp.MustCompile(`[A-Z]`).MatchString(password)
+	hasLower := regexp.MustCompile(`[a-z]`).MatchString(password)
+	hasDigit := regexp.MustCompile(`\d`).MatchString(password)
+	hasSpecial := regexp.MustCompile(`[!@#$%^&*()_+\-=\[\]{};:'",.<>/?]`).MatchString(password)
+	// At least 3 of 4 character classes
+	classes := 0
+	if hasUpper {
+		classes++
+	}
+	if hasLower {
+		classes++
+	}
+	if hasDigit {
+		classes++
+	}
+	if hasSpecial {
+		classes++
+	}
+	return classes >= 3
+}
+
+// ======================================================================
+// Profile Management
+// ======================================================================
+
+// UpdateProfile updates the user's profile fields.
+func (u *User) UpdateProfile(fullName, bio, location, website string) error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	if u.IsSuspended {
+	if u.Status == UserStatusSuspended {
 		return ErrUserSuspended
 	}
-	if !u.IsActive {
-		return ErrUserInactive
+	u.FullName = strings.TrimSpace(fullName)
+	if u.FullName == "" {
+		return ErrFullNameEmpty
 	}
-	// Validate new password
-	tmp := &User{Password: newPassword}
-	if err := tmp.Validate(); err != nil {
-		return err
+	if len(u.FullName) > MaxFullNameLength {
+		return ErrFullNameTooLong
 	}
-	u.Password = newPassword
-	return u.HashPassword()
+	u.Bio = strings.TrimSpace(bio)
+	if len(u.Bio) > MaxBioLength {
+		return ErrBioTooLong
+	}
+	u.Location = strings.TrimSpace(location)
+	u.Website = strings.TrimSpace(website)
+	return nil
 }
 
-// UpdateProfile updates the user's profile fields (full name, bio, avatar).
-func (u *User) UpdateProfile(fullName, bio, avatarURL string) error {
+// UpdateAvatar updates the user's avatar URL.
+func (u *User) UpdateAvatar(avatarURL string) error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	if u.IsSuspended {
+	if u.Status == UserStatusSuspended {
 		return ErrUserSuspended
 	}
-	if !u.IsActive {
-		return ErrUserInactive
-	}
-	u.FullName = fullName
-	u.Bio = bio
-	u.AvatarURL = avatarURL
-	return u.Validate()
+	u.AvatarURL = strings.TrimSpace(avatarURL)
+	return nil
 }
 
-// Activate sets the user as active.
+// UpdateBanner updates the user's banner URL.
+func (u *User) UpdateBanner(bannerURL string) error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	if u.Status == UserStatusSuspended {
+		return ErrUserSuspended
+	}
+	u.BannerURL = strings.TrimSpace(bannerURL)
+	return nil
+}
+
+// UpdateMetadata updates user metadata.
+func (u *User) UpdateMetadata(metadata UserMetadata) error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	u.Metadata = metadata
+	return nil
+}
+
+// ======================================================================
+= Status Management
+// ======================================================================
+
+// Activate activates the user.
 func (u *User) Activate() error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	u.IsActive = true
-	u.IsSuspended = false
+	if u.Status == UserStatusActive {
+		return ErrUserAlreadyActive
+	}
+	u.Status = UserStatusActive
 	return nil
 }
 
-// Deactivate sets the user as inactive (not deleted, just inactive).
+// Deactivate deactivates the user.
 func (u *User) Deactivate() error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	u.IsActive = false
+	if u.Status == UserStatusInactive {
+		return errors.New("user is already inactive")
+	}
+	u.Status = UserStatusInactive
 	return nil
 }
 
-// Suspend suspends the user with a reason.
-func (u *User) Suspend(reason string) error {
+// Suspend suspends the user.
+func (u *User) Suspend() error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	if u.IsSuspended {
-		return errors.New("user is already suspended")
+	if u.Status == UserStatusSuspended {
+		return ErrUserAlreadySuspended
 	}
-	u.IsSuspended = true
-	u.IsActive = false
-	u.SuspendedReason = reason
+	u.Status = UserStatusSuspended
 	return nil
 }
 
-// Unsuspend reinstates a suspended user.
+// Unsuspend unsuspends the user.
 func (u *User) Unsuspend() error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
-	if !u.IsSuspended {
+	if u.Status != UserStatusSuspended {
 		return errors.New("user is not suspended")
 	}
-	u.IsSuspended = false
-	u.IsActive = true
-	u.SuspendedReason = ""
+	u.Status = UserStatusActive
 	return nil
 }
 
-// Verify marks the user as verified.
-func (u *User) Verify() error {
-	if u.DeletedAt != nil {
-		return ErrUserAlreadyDeleted
-	}
-	if u.IsSuspended {
-		return ErrUserSuspended
-	}
-	u.IsVerified = true
-	return nil
+// IsActive checks if the user is active.
+func (u *User) IsActive() bool {
+	return u.Status == UserStatusActive && u.DeletedAt == nil
 }
 
-// Unverify removes the verified status.
-func (u *User) Unverify() error {
-	if u.DeletedAt != nil {
-		return ErrUserAlreadyDeleted
-	}
-	u.IsVerified = false
-	return nil
+// IsSuspended checks if the user is suspended.
+func (u *User) IsSuspended() bool {
+	return u.Status == UserStatusSuspended
 }
 
-// Delete soft-deletes the user.
-func (u *User) Delete() error {
+// IsInactive checks if the user is inactive.
+func (u *User) IsInactive() bool {
+	return u.Status == UserStatusInactive
+}
+
+// ======================================================================
+= Deletion Operations
+// ======================================================================
+
+// SoftDelete marks the user as deleted.
+func (u *User) SoftDelete() error {
 	if u.DeletedAt != nil {
 		return ErrUserAlreadyDeleted
 	}
 	now := time.Now()
 	u.DeletedAt = &now
-	u.IsActive = false
+	u.Status = UserStatusDeleted
 	return nil
 }
 
 // Restore restores a soft-deleted user.
 func (u *User) Restore() error {
 	if u.DeletedAt == nil {
-		return errors.New("user is not deleted")
+		return ErrUserNotDeleted
 	}
 	u.DeletedAt = nil
-	u.IsActive = true
+	u.Status = UserStatusActive
 	return nil
 }
 
-// GetStatus returns the user's current status.
-func (u *User) GetStatus() UserStatus {
+// IsDeleted checks if the user is deleted.
+func (u *User) IsDeleted() bool {
+	return u.DeletedAt != nil
+}
+
+// ======================================================================
+= Verification
+// ======================================================================
+
+// Verify marks the user as verified.
+func (u *User) Verify() error {
 	if u.DeletedAt != nil {
-		return StatusDeleted
+		return ErrUserAlreadyDeleted
 	}
-	if u.IsSuspended {
-		return StatusSuspended
+	if u.IsVerified {
+		return errors.New("user is already verified")
 	}
-	if !u.IsActive {
-		return StatusInactive
-	}
-	return StatusActive
+	u.IsVerified = true
+	return nil
 }
 
-// IsAdmin checks if the user has admin role.
+// Unverify removes verified status.
+func (u *User) Unverify() error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	if !u.IsVerified {
+		return errors.New("user is not verified")
+	}
+	u.IsVerified = false
+	return nil
+}
+
+// ======================================================================
+// Privacy
+// ======================================================================
+
+// SetPrivate makes the account private.
+func (u *User) SetPrivate() error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	u.IsPrivate = true
+	return nil
+}
+
+// SetPublic makes the account public.
+func (u *User) SetPublic() error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	u.IsPrivate = false
+	return nil
+}
+
+// ======================================================================
+// Role Management
+// ======================================================================
+
+// SetRole sets the user's role.
+func (u *User) SetRole(role string) error {
+	if u.DeletedAt != nil {
+		return ErrUserAlreadyDeleted
+	}
+	if !isValidRole(role) {
+		return ErrInvalidRole
+	}
+	u.Role = role
+	return nil
+}
+
+// IsAdmin checks if the user is an admin.
 func (u *User) IsAdmin() bool {
-	return u.Role == RoleAdmin
+	return u.Role == UserRoleAdmin
 }
 
-// IsModerator checks if the user has moderator or admin role.
+// IsModerator checks if the user is a moderator.
 func (u *User) IsModerator() bool {
-	return u.Role == RoleModerator || u.Role == RoleAdmin
+	return u.Role == UserRoleModerator || u.IsAdmin()
 }
 
-// CanModerate checks if the user can moderate content (moderator or admin).
-func (u *User) CanModerate() bool {
-	return u.IsModerator()
+// IsRegularUser checks if the user is a regular user.
+func (u *User) IsRegularUser() bool {
+	return u.Role == UserRoleUser
 }
 
-// IsOwner checks if the user owns a given resource (by ID).
-func (u *User) IsOwner(resourceUserID string) bool {
-	return u.ID == resourceUserID
-}
+// ======================================================================
+// Activity
+// ======================================================================
 
-// IncrementTweetCount increases the tweet counter by 1.
-func (u *User) IncrementTweetCount() {
-	u.TweetCount++
-}
-
-// DecrementTweetCount decreases the tweet counter by 1 (minimum 0).
-func (u *User) DecrementTweetCount() {
-	if u.TweetCount > 0 {
-		u.TweetCount--
-	}
-}
-
-// IncrementFollowerCount increases the follower count.
-func (u *User) IncrementFollowerCount() {
-	u.FollowerCount++
-}
-
-// DecrementFollowerCount decreases the follower count (minimum 0).
-func (u *User) DecrementFollowerCount() {
-	if u.FollowerCount > 0 {
-		u.FollowerCount--
-	}
-}
-
-// IncrementFollowingCount increases the following count.
-func (u *User) IncrementFollowingCount() {
-	u.FollowingCount++
-}
-
-// DecrementFollowingCount decreases the following count (minimum 0).
-func (u *User) DecrementFollowingCount() {
-	if u.FollowingCount > 0 {
-		u.FollowingCount--
-	}
-}
-
-// UpdateLastActive updates the last active timestamp to now.
+// UpdateLastActive updates the last active timestamp.
 func (u *User) UpdateLastActive() {
 	now := time.Now()
-	u.LastActive = &now
+	u.LastActiveAt = &now
 }
 
-// BeforeSave prepares the user for persistence (e.g., hashing password).
-func (u *User) BeforeSave() error {
-	if u.Password != "" {
-		if err := u.HashPassword(); err != nil {
-			return err
-		}
-		u.Password = "" // clear plain-text after hashing
-	}
-	return u.Validate()
+// DaysSinceJoin returns the number of days since the user joined.
+func (u *User) DaysSinceJoin() int {
+	return int(time.Since(u.JoinedAt).Hours() / 24)
 }
 
-// ToPublic returns a copy of the user with sensitive fields removed.
-func (u *User) ToPublic() *User {
-	clone := *u
-	clone.Password = ""
-	clone.PasswordHash = ""
-	return &clone
-}
+// ======================================================================
+// Helper Methods
+// ======================================================================
 
 // String returns a human-readable representation.
 func (u *User) String() string {
-	return fmt.Sprintf("User{ID: %s, Username: %s, FullName: %s, Role: %s, Status: %s}",
-		u.ID, u.Username, u.FullName, u.Role, u.GetStatus())
-}
-
-// Equals checks if two users are the same by ID.
-func (u *User) Equals(other *User) bool {
-	return u.ID == other.ID
+	return fmt.Sprintf("User{ID:%s, username:%s, email:%s, role:%s, status:%s, joined:%v}",
+		u.ID, u.Username, u.Email, u.Role, u.Status, u.JoinedAt)
 }
 
 // Clone returns a deep copy of the user.
 func (u *User) Clone() *User {
 	clone := *u
-	if u.LastActive != nil {
-		t := *u.LastActive
-		clone.LastActive = &t
+	if u.LastActiveAt != nil {
+		t := *u.LastActiveAt
+		clone.LastActiveAt = &t
 	}
 	if u.DeletedAt != nil {
 		t := *u.DeletedAt
@@ -441,37 +627,349 @@ func (u *User) Clone() *User {
 	return &clone
 }
 
-// SetRole safely sets the role.
-func (u *User) SetRole(role UserRole) error {
-	if role != RoleUser && role != RoleModerator && role != RoleAdmin {
-		return ErrInvalidRole
+// Equals checks if two users are the same by ID.
+func (u *User) Equals(other *User) bool {
+	return u.ID == other.ID
+}
+
+// IsEmpty returns true if the user is zero value.
+func (u *User) IsEmpty() bool {
+	return u.ID == "" && u.Username == "" && u.Email == ""
+}
+
+// ======================================================================
+= Database Value Handling
+// ======================================================================
+
+// Value implements driver.Valuer for JSONB storage.
+func (u User) Value() (driver.Value, error) {
+	return json.Marshal(u)
+}
+
+// Scan implements sql.Scanner for JSONB retrieval.
+func (u *User) Scan(value interface{}) error {
+	if value == nil {
+		return nil
 	}
-	u.Role = role
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported type for User: %T", value)
+	}
+	return json.Unmarshal(bytes, u)
+}
+
+// ======================================================================
+= JSON Custom Marshaling
+// ======================================================================
+
+// MarshalJSON implements custom JSON marshaling.
+func (u *User) MarshalJSON() ([]byte, error) {
+	type Alias User
+	return json.Marshal(&struct {
+		*Alias
+		Status     string `json:"status"`
+		IsActive   bool   `json:"is_active"`
+		IsAdmin    bool   `json:"is_admin"`
+		IsModerator bool  `json:"is_moderator"`
+		DaysJoined int    `json:"days_joined"`
+	}{
+		Alias:       (*Alias)(u),
+		Status:      u.Status,
+		IsActive:    u.IsActive(),
+		IsAdmin:     u.IsAdmin(),
+		IsModerator: u.IsModerator(),
+		DaysJoined:  u.DaysSinceJoin(),
+	})
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling.
+func (u *User) UnmarshalJSON(data []byte) error {
+	type Alias User
+	aux := &struct {
+		*Alias
+		Status string `json:"status"`
+	}{
+		Alias: (*Alias)(u),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if aux.Status != "" {
+		u.Status = aux.Status
+	}
 	return nil
 }
 
-// HasPermission checks if the user has a given permission (simplified).
-// Could be extended with RBAC.
-func (u *User) HasPermission(action string) bool {
-	// For now, admins have all permissions, moderators have moderate, users have basic.
-	switch action {
-	case "admin":
+// ======================================================================
+= User Collection
+// ======================================================================
+
+// UserCollection provides advanced operations on a slice of users.
+type UserCollection []*User
+
+// Len returns the number of users.
+func (c UserCollection) Len() int { return len(c) }
+
+// Filter returns a new collection with users matching the predicate.
+func (c UserCollection) Filter(predicate func(*User) bool) UserCollection {
+	result := UserCollection{}
+	for _, u := range c {
+		if predicate(u) {
+			result = append(result, u)
+		}
+	}
+	return result
+}
+
+// SortByJoinedAt sorts users by join date (newest first).
+func (c UserCollection) SortByJoinedAt() {
+	sort.Slice(c, func(i, j int) bool {
+		return c[i].JoinedAt.After(c[j].JoinedAt)
+	})
+}
+
+// SortByUsername sorts users by username.
+func (c UserCollection) SortByUsername() {
+	sort.Slice(c, func(i, j int) bool {
+		return c[i].Username < c[j].Username
+	})
+}
+
+// GetActive returns active users.
+func (c UserCollection) GetActive() UserCollection {
+	return c.Filter(func(u *User) bool {
+		return u.IsActive()
+	})
+}
+
+// GetAdmins returns admin users.
+func (c UserCollection) GetAdmins() UserCollection {
+	return c.Filter(func(u *User) bool {
 		return u.IsAdmin()
-	case "moderate":
-		return u.IsModerator()
-	case "write":
-		return u.GetStatus() == StatusActive
-	default:
-		return false
+	})
+}
+
+// GetByRole returns users with a specific role.
+func (c UserCollection) GetByRole(role string) UserCollection {
+	return c.Filter(func(u *User) bool {
+		return u.Role == role
+	})
+}
+
+// ======================================================================
+= User Statistics
+// ======================================================================
+
+// UserStats represents user statistics.
+type UserStats struct {
+	TotalUsers     int64 `json:"total_users"`
+	ActiveUsers    int64 `json:"active_users"`
+	SuspendedUsers int64 `json:"suspended_users"`
+	DeletedUsers   int64 `json:"deleted_users"`
+	Admins         int64 `json:"admins"`
+	Moderators     int64 `json:"moderators"`
+	VerifiedUsers  int64 `json:"verified_users"`
+}
+
+// CalculateStats calculates statistics from a user collection.
+func (c UserCollection) CalculateStats() *UserStats {
+	stats := &UserStats{
+		TotalUsers: int64(len(c)),
+	}
+	for _, u := range c {
+		if u.IsActive() {
+			stats.ActiveUsers++
+		}
+		if u.IsSuspended() {
+			stats.SuspendedUsers++
+		}
+		if u.IsDeleted() {
+			stats.DeletedUsers++
+		}
+		if u.IsAdmin() {
+			stats.Admins++
+		}
+		if u.IsModerator() {
+			stats.Moderators++
+		}
+		if u.IsVerified {
+			stats.VerifiedUsers++
+		}
+	}
+	return stats
+}
+
+// ======================================================================
+= Builder Pattern (for tests)
+// ======================================================================
+
+// UserBuilder helps construct users for testing.
+type UserBuilder struct {
+	user *User
+}
+
+// NewUserBuilder creates a new user builder.
+func NewUserBuilder() *UserBuilder {
+	return &UserBuilder{
+		user: &User{
+			ID:         uuid.New().String(),
+			Username:   "",
+			Email:      "",
+			PasswordHash: "",
+			FullName:   "",
+			Bio:        "",
+			Role:       UserRoleUser,
+			Status:     UserStatusActive,
+			IsVerified: false,
+			IsPrivate:  false,
+			JoinedAt:   time.Now(),
+		},
 	}
 }
 
-// IsProfileComplete checks if all required fields are filled.
-func (u *User) IsProfileComplete() bool {
-	return u.FullName != "" && u.AvatarURL != "" && u.Bio != ""
+// WithID sets the ID.
+func (b *UserBuilder) WithID(id string) *UserBuilder {
+	b.user.ID = id
+	return b
 }
 
-// DaysSinceJoin returns the number of days since the user joined.
-func (u *User) DaysSinceJoin() int {
-	return int(time.Since(u.CreatedAt).Hours() / 24)
+// WithUsername sets the username.
+func (b *UserBuilder) WithUsername(username string) *UserBuilder {
+	b.user.Username = username
+	return b
+}
+
+// WithEmail sets the email.
+func (b *UserBuilder) WithEmail(email string) *UserBuilder {
+	b.user.Email = email
+	return b
+}
+
+// WithFullName sets the full name.
+func (b *UserBuilder) WithFullName(fullName string) *UserBuilder {
+	b.user.FullName = fullName
+	return b
+}
+
+// WithBio sets the bio.
+func (b *UserBuilder) WithBio(bio string) *UserBuilder {
+	b.user.Bio = bio
+	return b
+}
+
+// WithAvatarURL sets the avatar URL.
+func (b *UserBuilder) WithAvatarURL(url string) *UserBuilder {
+	b.user.AvatarURL = url
+	return b
+}
+
+// WithRole sets the role.
+func (b *UserBuilder) WithRole(role string) *UserBuilder {
+	b.user.Role = role
+	return b
+}
+
+// WithStatus sets the status.
+func (b *UserBuilder) WithStatus(status string) *UserBuilder {
+	b.user.Status = status
+	return b
+}
+
+// WithPassword sets the password hash.
+func (b *UserBuilder) WithPassword(password string) *UserBuilder {
+	_ = b.user.SetPassword(password)
+	return b
+}
+
+// WithVerified sets verified status.
+func (b *UserBuilder) WithVerified(verified bool) *UserBuilder {
+	b.user.IsVerified = verified
+	return b
+}
+
+// WithPrivate sets private status.
+func (b *UserBuilder) WithPrivate(private bool) *UserBuilder {
+	b.user.IsPrivate = private
+	return b
+}
+
+// WithJoinedAt sets the join date.
+func (b *UserBuilder) WithJoinedAt(t time.Time) *UserBuilder {
+	b.user.JoinedAt = t
+	return b
+}
+
+// WithLastActive sets the last active timestamp.
+func (b *UserBuilder) WithLastActive(t time.Time) *UserBuilder {
+	b.user.LastActiveAt = &t
+	return b
+}
+
+// WithDeleted sets the deleted timestamp.
+func (b *UserBuilder) WithDeleted(t time.Time) *UserBuilder {
+	b.user.DeletedAt = &t
+	b.user.Status = UserStatusDeleted
+	return b
+}
+
+// Build validates and returns the user.
+func (b *UserBuilder) Build() (*User, error) {
+	if err := b.user.Validate(); err != nil {
+		return nil, err
+	}
+	return b.user, nil
+}
+
+// MustBuild builds without error (panics on error).
+func (b *UserBuilder) MustBuild() *User {
+	u, err := b.Build()
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+// ======================================================================
+= Test Helpers
+// ======================================================================
+
+var (
+	TestUser1 = MustNewUser("john_doe", "john@example.com", "Test@1234", "John Doe")
+	TestUser2 = MustNewUser("jane_smith", "jane@example.com", "Test@1234", "Jane Smith")
+	TestAdmin = MustNewUser("admin", "admin@example.com", "Admin@1234", "Admin User")
+)
+
+// MustNewAdminUser creates an admin user for testing.
+func MustNewAdminUser(username, email, password, fullName string) *User {
+	u, err := NewUser(username, email, password, fullName)
+	if err != nil {
+		panic(err)
+	}
+	u.Role = UserRoleAdmin
+	return u
+}
+
+// MustNewSuspendedUser creates a suspended user for testing.
+func MustNewSuspendedUser(username, email, password, fullName string) *User {
+	u, err := NewUser(username, email, password, fullName)
+	if err != nil {
+		panic(err)
+	}
+	_ = u.Suspend()
+	return u
+}
+
+// MustNewDeletedUser creates a deleted user for testing.
+func MustNewDeletedUser(username, email, password, fullName string) *User {
+	u, err := NewUser(username, email, password, fullName)
+	if err != nil {
+		panic(err)
+	}
+	_ = u.SoftDelete()
+	return u
 }
