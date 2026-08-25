@@ -466,8 +466,8 @@ func (h *HealthHandler) Metrics(w http.ResponseWriter, r *http.Request) {
 // @Router /version [get]
 func (h *HealthHandler) Version(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
-		"version":     "1.0.0",
-		"build_time":  time.Now().Format(time.RFC3339),
+		"version":     h.config.Version,
+		"build_time":  h.config.BuildTime,
 		"go_version":  runtime.Version(),
 		"environment": h.config.Environment,
 	}
