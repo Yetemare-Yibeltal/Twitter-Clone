@@ -21,11 +21,11 @@ import (
 
 // TimelineHandler handles all timeline-related HTTP endpoints.
 type TimelineHandler struct {
-	feedService      service.FeedService
-	tweetService     service.TweetService
-	followService    service.FollowService
+	feedService         service.FeedService
+	tweetService        service.TweetService
+	followService       service.FollowService
 	notificationService service.NotificationService
-	log              *logrus.Entry
+	log                 *logrus.Entry
 }
 
 // NewTimelineHandler creates a new timeline handler.
@@ -36,11 +36,11 @@ func NewTimelineHandler(
 	notificationService service.NotificationService,
 ) *TimelineHandler {
 	return &TimelineHandler{
-		feedService:      feedService,
-		tweetService:     tweetService,
-		followService:    followService,
+		feedService:         feedService,
+		tweetService:        tweetService,
+		followService:       followService,
 		notificationService: notificationService,
-		log:              logger.WithField("handler", "timeline"),
+		log:                 logger.WithField("handler", "timeline"),
 	}
 }
 
@@ -58,6 +58,7 @@ func NewTimelineHandler(
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param include_replies query bool false "Include replies in timeline"
 // @Param include_retweets query bool false "Include retweets in timeline"
+// @Param show_media_only query bool false "Only show tweets with media"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -76,8 +77,9 @@ func (h *TimelineHandler) GetHomeTimeline(w http.ResponseWriter, r *http.Request
 	}
 	includeReplies, _ := strconv.ParseBool(r.URL.Query().Get("include_replies"))
 	includeRetweets, _ := strconv.ParseBool(r.URL.Query().Get("include_retweets"))
+	mediaOnly, _ := strconv.ParseBool(r.URL.Query().Get("show_media_only"))
 
-	tweets, nextCursor, total, err := h.feedService.GetHomeTimeline(r.Context(), userID, cursor, limit, includeReplies, includeRetweets)
+	tweets, nextCursor, total, err := h.feedService.GetHomeTimeline(r.Context(), userID, cursor, limit, includeReplies, includeRetweets, mediaOnly)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get home timeline")
 		return
@@ -87,11 +89,11 @@ func (h *TimelineHandler) GetHomeTimeline(w http.ResponseWriter, r *http.Request
 	unreadCount, _ := h.notificationService.GetUnreadCount(r.Context(), userID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":              tweets,
-		"next_cursor":       nextCursor,
-		"has_more":          nextCursor != "",
-		"limit":             limit,
-		"total":             total,
+		"data":                tweets,
+		"next_cursor":         nextCursor,
+		"has_more":            nextCursor != "",
+		"limit":               limit,
+		"total":               total,
 		"unread_notifications": unreadCount,
 	})
 }
@@ -109,6 +111,7 @@ func (h *TimelineHandler) GetHomeTimeline(w http.ResponseWriter, r *http.Request
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param include_replies query bool false "Include replies"
+// @Param include_retweets query bool false "Include retweets"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -127,10 +130,11 @@ func (h *TimelineHandler) GetUserTimeline(w http.ResponseWriter, r *http.Request
 		limit = 20
 	}
 	includeReplies, _ := strconv.ParseBool(r.URL.Query().Get("include_replies"))
+	includeRetweets, _ := strconv.ParseBool(r.URL.Query().Get("include_retweets"))
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	tweets, nextCursor, total, err := h.feedService.GetUserTimeline(r.Context(), username, cursor, limit, includeReplies, currentUserID)
+	tweets, nextCursor, total, err := h.feedService.GetUserTimeline(r.Context(), username, cursor, limit, includeReplies, includeRetweets, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get user timeline")
 		return
@@ -147,7 +151,7 @@ func (h *TimelineHandler) GetUserTimeline(w http.ResponseWriter, r *http.Request
 }
 
 // ======================================================================
-= Get Mentions Timeline
+// Get Mentions Timeline
 // ======================================================================
 
 // GetMentionsTimeline handles retrieving tweets mentioning the user.
@@ -174,8 +178,9 @@ func (h *TimelineHandler) GetMentionsTimeline(w http.ResponseWriter, r *http.Req
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	includeRetweets, _ := strconv.ParseBool(r.URL.Query().Get("include_retweets"))
 
-	tweets, nextCursor, total, err := h.feedService.GetMentionsTimeline(r.Context(), userID, cursor, limit)
+	tweets, nextCursor, total, err := h.feedService.GetMentionsTimeline(r.Context(), userID, cursor, limit, includeRetweets)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get mentions timeline")
 		return
@@ -191,7 +196,7 @@ func (h *TimelineHandler) GetMentionsTimeline(w http.ResponseWriter, r *http.Req
 }
 
 // ======================================================================
-= Get Hashtag Timeline
+// Get Hashtag Timeline
 // ======================================================================
 
 // GetHashtagTimeline handles retrieving tweets by hashtag.
@@ -202,6 +207,7 @@ func (h *TimelineHandler) GetMentionsTimeline(w http.ResponseWriter, r *http.Req
 // @Param hashtag path string true "Hashtag (without #)"
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param since query string false "Since timestamp (ISO 8601)"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -221,10 +227,17 @@ func (h *TimelineHandler) GetHashtagTimeline(w http.ResponseWriter, r *http.Requ
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	since := r.URL.Query().Get("since")
+	var sinceTime time.Time
+	if since != "" {
+		if t, err := time.Parse(time.RFC3339, since); err == nil {
+			sinceTime = t
+		}
+	}
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	tweets, nextCursor, total, err := h.feedService.GetHashtagTimeline(r.Context(), hashtag, cursor, limit, currentUserID)
+	tweets, nextCursor, total, err := h.feedService.GetHashtagTimeline(r.Context(), hashtag, cursor, limit, sinceTime, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get hashtag timeline")
 		return
@@ -241,7 +254,7 @@ func (h *TimelineHandler) GetHashtagTimeline(w http.ResponseWriter, r *http.Requ
 }
 
 // ======================================================================
-= Get Trending Timeline
+// Get Trending Timeline
 // ======================================================================
 
 // GetTrendingTimeline handles retrieving trending tweets.
@@ -251,6 +264,7 @@ func (h *TimelineHandler) GetHashtagTimeline(w http.ResponseWriter, r *http.Requ
 // @Produce json
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param since query string false "Since timestamp (ISO 8601)"
+// @Param category query string false "Category (global, for-you, following, local)"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/timeline/trending [get]
@@ -269,25 +283,30 @@ func (h *TimelineHandler) GetTrendingTimeline(w http.ResponseWriter, r *http.Req
 	if sinceTime.IsZero() {
 		sinceTime = time.Now().Add(-24 * time.Hour)
 	}
+	category := r.URL.Query().Get("category")
+	if category == "" {
+		category = "global"
+	}
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	tweets, total, err := h.feedService.GetTrendingTimeline(r.Context(), limit, sinceTime, currentUserID)
+	tweets, total, err := h.feedService.GetTrendingTimeline(r.Context(), limit, sinceTime, category, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get trending timeline")
 		return
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":  tweets,
-		"limit": limit,
-		"since": sinceTime.Format(time.RFC3339),
-		"total": total,
+		"data":     tweets,
+		"limit":    limit,
+		"since":    sinceTime.Format(time.RFC3339),
+		"total":    total,
+		"category": category,
 	})
 }
 
 // ======================================================================
-= Get For You Timeline (Personalized)
+// Get For You Timeline (Personalized)
 // ======================================================================
 
 // GetForYouTimeline handles retrieving personalized timeline.
@@ -298,6 +317,7 @@ func (h *TimelineHandler) GetTrendingTimeline(w http.ResponseWriter, r *http.Req
 // @Produce json
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param diversity query float64 false "Diversity factor (0.0 - 1.0, default 0.3)"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -314,8 +334,12 @@ func (h *TimelineHandler) GetForYouTimeline(w http.ResponseWriter, r *http.Reque
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	diversity, _ := strconv.ParseFloat(r.URL.Query().Get("diversity"), 64)
+	if diversity < 0 || diversity > 1 {
+		diversity = 0.3
+	}
 
-	tweets, nextCursor, total, err := h.feedService.GetForYouTimeline(r.Context(), userID, cursor, limit)
+	tweets, nextCursor, total, err := h.feedService.GetForYouTimeline(r.Context(), userID, cursor, limit, diversity)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get personalized timeline")
 		return
@@ -327,11 +351,12 @@ func (h *TimelineHandler) GetForYouTimeline(w http.ResponseWriter, r *http.Reque
 		"has_more":    nextCursor != "",
 		"limit":       limit,
 		"total":       total,
+		"diversity":   diversity,
 	})
 }
 
 // ======================================================================
-= Get Bookmarks Timeline (User's bookmarks)
+// Get Bookmarks Timeline
 // ======================================================================
 
 // GetBookmarksTimeline handles retrieving the user's bookmarked tweets.
@@ -375,7 +400,7 @@ func (h *TimelineHandler) GetBookmarksTimeline(w http.ResponseWriter, r *http.Re
 }
 
 // ======================================================================
-= Get Likes Timeline (User's liked tweets)
+// Get Likes Timeline
 // ======================================================================
 
 // GetLikesTimeline handles retrieving the user's liked tweets.
@@ -419,7 +444,7 @@ func (h *TimelineHandler) GetLikesTimeline(w http.ResponseWriter, r *http.Reques
 }
 
 // ======================================================================
-= Get Media Timeline
+// Get Media Timeline
 // ======================================================================
 
 // GetMediaTimeline handles retrieving tweets with media.
@@ -430,6 +455,7 @@ func (h *TimelineHandler) GetLikesTimeline(w http.ResponseWriter, r *http.Reques
 // @Produce json
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param media_type query string false "Media type (image, video, all) default all"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -446,8 +472,12 @@ func (h *TimelineHandler) GetMediaTimeline(w http.ResponseWriter, r *http.Reques
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	mediaType := r.URL.Query().Get("media_type")
+	if mediaType == "" {
+		mediaType = "all"
+	}
 
-	tweets, nextCursor, total, err := h.feedService.GetMediaTimeline(r.Context(), userID, cursor, limit)
+	tweets, nextCursor, total, err := h.feedService.GetMediaTimeline(r.Context(), userID, cursor, limit, mediaType)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get media timeline")
 		return
@@ -459,11 +489,12 @@ func (h *TimelineHandler) GetMediaTimeline(w http.ResponseWriter, r *http.Reques
 		"has_more":    nextCursor != "",
 		"limit":       limit,
 		"total":       total,
+		"media_type":  mediaType,
 	})
 }
 
 // ======================================================================
-= Get Mixed Timeline (Combined)
+// Get Mixed Timeline
 // ======================================================================
 
 // GetMixedTimeline handles retrieving a mixed timeline of various sources.
@@ -474,6 +505,7 @@ func (h *TimelineHandler) GetMediaTimeline(w http.ResponseWriter, r *http.Reques
 // @Produce json
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param sources query string false "Comma-separated sources (home, trending, for-you, media) default all"
 // @Success 200 {object} dto.TimelineResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -490,8 +522,12 @@ func (h *TimelineHandler) GetMixedTimeline(w http.ResponseWriter, r *http.Reques
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	sources := r.URL.Query().Get("sources")
+	if sources == "" {
+		sources = "home,trending,for-you,media"
+	}
 
-	tweets, nextCursor, total, err := h.feedService.GetMixedTimeline(r.Context(), userID, cursor, limit)
+	tweets, nextCursor, total, err := h.feedService.GetMixedTimeline(r.Context(), userID, cursor, limit, sources)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get mixed timeline")
 		return
@@ -503,6 +539,7 @@ func (h *TimelineHandler) GetMixedTimeline(w http.ResponseWriter, r *http.Reques
 		"has_more":    nextCursor != "",
 		"limit":       limit,
 		"total":       total,
+		"sources":     sources,
 	})
 }
 
@@ -591,6 +628,7 @@ func (h *TimelineHandler) UpdateTimelinePreferences(w http.ResponseWriter, r *ht
 // @Security BearerAuth
 // @Produce json
 // @Param days query int false "Days to analyze (default 7, max 30)"
+// @Param granularity query string false "Granularity (hourly, daily, weekly) default daily"
 // @Success 200 {object} dto.TimelineStatsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
@@ -608,8 +646,12 @@ func (h *TimelineHandler) AdminGetTimelineStats(w http.ResponseWriter, r *http.R
 	if err != nil || days < 1 || days > 30 {
 		days = 7
 	}
+	granularity := r.URL.Query().Get("granularity")
+	if granularity == "" {
+		granularity = "daily"
+	}
 
-	stats, err := h.feedService.AdminGetTimelineStats(r.Context(), days)
+	stats, err := h.feedService.AdminGetTimelineStats(r.Context(), days, granularity)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get timeline stats")
 		return
@@ -625,6 +667,7 @@ func (h *TimelineHandler) AdminGetTimelineStats(w http.ResponseWriter, r *http.R
 // @Security BearerAuth
 // @Produce json
 // @Param user_id query string false "User ID (optional)"
+// @Param timeline_type query string false "Timeline type (home, user, mentions, hashtag, all) default all"
 // @Success 200 {object} dto.SuccessResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
@@ -639,24 +682,57 @@ func (h *TimelineHandler) AdminClearCache(w http.ResponseWriter, r *http.Request
 	}
 
 	userID := r.URL.Query().Get("user_id")
+	timelineType := r.URL.Query().Get("timeline_type")
+	if timelineType == "" {
+		timelineType = "all"
+	}
 
 	if userID != "" {
-		if err := h.feedService.ClearUserCache(r.Context(), userID); err != nil {
+		if err := h.feedService.ClearUserCache(r.Context(), userID, timelineType); err != nil {
 			h.handleServiceError(w, err, "Failed to clear user cache")
 			return
 		}
 	} else {
-		if err := h.feedService.ClearAllCache(r.Context()); err != nil {
+		if err := h.feedService.ClearAllCache(r.Context(), timelineType); err != nil {
 			h.handleServiceError(w, err, "Failed to clear all cache")
 			return
 		}
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success":   true,
-		"message":   "Cache cleared successfully",
-		"user_id":   userID,
+		"success":       true,
+		"message":       "Cache cleared successfully",
+		"user_id":       userID,
+		"timeline_type": timelineType,
 	})
+}
+
+// AdminGetTimelineHealth handles retrieving timeline health status.
+// @Summary Admin get timeline health
+// @Description Retrieves timeline system health status (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.TimelineHealthResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/timeline/health [get]
+func (h *TimelineHandler) AdminGetTimelineHealth(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	health, err := h.feedService.AdminGetTimelineHealth(r.Context())
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get timeline health")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, health)
 }
 
 // ======================================================================
@@ -707,6 +783,18 @@ func (h *TimelineHandler) handleServiceError(w http.ResponseWriter, err error, d
 		h.sendError(w, http.StatusBadRequest, "Invalid cursor", nil)
 	case errors.Is(err, service.ErrTimelinePreferencesNotFound):
 		h.sendError(w, http.StatusNotFound, "Timeline preferences not found", nil)
+	case errors.Is(err, service.ErrInvalidGranularity):
+		h.sendError(w, http.StatusBadRequest, "Invalid granularity", nil)
+	case errors.Is(err, service.ErrInvalidTimelineType):
+		h.sendError(w, http.StatusBadRequest, "Invalid timeline type", nil)
+	case errors.Is(err, service.ErrInvalidDiversityFactor):
+		h.sendError(w, http.StatusBadRequest, "Invalid diversity factor (must be between 0 and 1)", nil)
+	case errors.Is(err, service.ErrInvalidMediaType):
+		h.sendError(w, http.StatusBadRequest, "Invalid media type", nil)
+	case errors.Is(err, service.ErrInvalidSource):
+		h.sendError(w, http.StatusBadRequest, "Invalid source", nil)
+	case errors.Is(err, service.ErrCacheClearFailed):
+		h.sendError(w, http.StatusInternalServerError, "Failed to clear cache", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
