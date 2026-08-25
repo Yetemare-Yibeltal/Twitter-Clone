@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 
@@ -40,6 +39,8 @@ var (
 	ErrFeedItemAlreadyDismissed = errors.New("feed item already dismissed")
 	ErrFeedGenerationFailed   = errors.New("feed generation failed")
 	ErrInvalidFeedType        = errors.New("invalid feed type")
+	ErrUserNotFound           = errors.New("user not found")
+	ErrTweetNotFound          = errors.New("tweet not found")
 )
 
 // ======================================================================
@@ -71,6 +72,7 @@ type feedService struct {
 	followRepo     interfaces.FollowRepository
 	likeRepo       interfaces.LikeRepository
 	retweetRepo    interfaces.RetweetRepository
+	bookmarkRepo   interfaces.BookmarkRepository
 	redisAdapter   adapter.RedisAdapter
 	log            *logrus.Entry
 }
@@ -82,6 +84,7 @@ func NewFeedService(
 	followRepo interfaces.FollowRepository,
 	likeRepo interfaces.LikeRepository,
 	retweetRepo interfaces.RetweetRepository,
+	bookmarkRepo interfaces.BookmarkRepository,
 	redisAdapter adapter.RedisAdapter,
 ) FeedService {
 	return &feedService{
@@ -90,6 +93,7 @@ func NewFeedService(
 		followRepo:   followRepo,
 		likeRepo:     likeRepo,
 		retweetRepo:  retweetRepo,
+		bookmarkRepo: bookmarkRepo,
 		redisAdapter: redisAdapter,
 		log:          logger.WithField("service", "feed"),
 	}
@@ -542,6 +546,11 @@ func (s *feedService) GetUserFeedStats(ctx context.Context, userID string) (*dto
 	if tweetStats.TotalTweets > 0 {
 		engagementRate = float64(tweetStats.TotalLikes+tweetStats.TotalRetweets) / float64(tweetStats.TotalTweets)
 	}
+	// Get user for join date
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
 	return &dto.UserFeedStatsResponse{
 		UserID:         userID,
 		TotalTweets:    tweetStats.TotalTweets,
@@ -551,7 +560,7 @@ func (s *feedService) GetUserFeedStats(ctx context.Context, userID string) (*dto
 		TotalFollowing: following,
 		EngagementRate: engagementRate,
 		LastTweetAt:    tweetStats.LastTweetAt,
-		JoinedAt:       time.Now(), // Should be from user
+		JoinedAt:       user.CreatedAt,
 	}, nil
 }
 
@@ -633,7 +642,7 @@ func (s *feedService) buildTweetResponse(ctx context.Context, tweet *entities.Tw
 	if currentUserID != "" {
 		liked, _ = s.likeRepo.Exists(ctx, tweet.ID, currentUserID)
 		retweeted, _ = s.retweetRepo.Exists(ctx, tweet.ID, currentUserID)
-		// Bookmark check would need bookmark repo
+		bookmarked, _ = s.bookmarkRepo.Exists(ctx, tweet.ID, currentUserID)
 	}
 	return &dto.TweetResponse{
 		ID:           tweet.ID,
@@ -692,4 +701,40 @@ func (s *feedService) invalidateFeedCache(ctx context.Context, userID string) er
 type ScoredTweet struct {
 	Tweet *entities.Tweet
 	Score float64
+}
+
+// ======================================================================
+// Service Registration
+// ======================================================================
+
+// Global feed service instance (optional)
+var defaultFeedService FeedService
+
+// InitFeedService initializes the global feed service.
+func InitFeedService(
+	tweetRepo interfaces.TweetRepository,
+	userRepo interfaces.UserRepository,
+	followRepo interfaces.FollowRepository,
+	likeRepo interfaces.LikeRepository,
+	retweetRepo interfaces.RetweetRepository,
+	bookmarkRepo interfaces.BookmarkRepository,
+	redisAdapter adapter.RedisAdapter,
+) {
+	defaultFeedService = NewFeedService(
+		tweetRepo,
+		userRepo,
+		followRepo,
+		likeRepo,
+		retweetRepo,
+		bookmarkRepo,
+		redisAdapter,
+	)
+}
+
+// GetFeedService returns the global feed service.
+func GetFeedService() FeedService {
+	if defaultFeedService == nil {
+		panic("feed service not initialized")
+	}
+	return defaultFeedService
 }
