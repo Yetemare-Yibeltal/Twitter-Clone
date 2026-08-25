@@ -23,7 +23,6 @@ import (
 type MuteHandler struct {
 	muteService service.MuteService
 	userService service.UserService
-	notificationService service.NotificationService
 	log         *logrus.Entry
 }
 
@@ -31,18 +30,16 @@ type MuteHandler struct {
 func NewMuteHandler(
 	muteService service.MuteService,
 	userService service.UserService,
-	notificationService service.NotificationService,
 ) *MuteHandler {
 	return &MuteHandler{
-		muteService:        muteService,
-		userService:        userService,
-		notificationService: notificationService,
-		log:                logger.WithField("handler", "mute"),
+		muteService: muteService,
+		userService: userService,
+		log:         logger.WithField("handler", "mute"),
 	}
 }
 
 // ======================================================================
-// Mute/Unmute User
+// Mute/Unmute
 // ======================================================================
 
 // MuteUser handles muting a user.
@@ -52,6 +49,7 @@ func NewMuteHandler(
 // @Security BearerAuth
 // @Param id path string true "User ID to mute"
 // @Param duration query int false "Mute duration in hours (default 24, 0 for permanent)"
+// @Param reason query string false "Reason for muting"
 // @Success 200 {object} dto.MuteResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -78,12 +76,17 @@ func (h *MuteHandler) MuteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse optional parameters
 	duration, _ := strconv.Atoi(r.URL.Query().Get("duration"))
 	if duration < 0 {
-		duration = 24
+		duration = 0
+	}
+	reason := r.URL.Query().Get("reason")
+	if reason != "" {
+		reason = strings.TrimSpace(reason)
 	}
 
-	result, err := h.muteService.MuteUser(r.Context(), userID, targetID, duration)
+	result, err := h.muteService.MuteUser(r.Context(), userID, targetID, duration, reason)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to mute user")
 		return
@@ -92,13 +95,22 @@ func (h *MuteHandler) MuteUser(w http.ResponseWriter, r *http.Request) {
 	// Get updated counts
 	mutedCount, _ := h.muteService.GetMutedCount(r.Context(), userID)
 
+	// Determine if the mute is permanent or temporary
+	isPermanent := duration == 0
+	expiresAt := ""
+	if !isPermanent {
+		expiresAt = time.Now().Add(time.Duration(duration) * time.Hour).Format(time.RFC3339)
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"muted":        result.Muted,
-		"muted_user_id": targetID,
-		"muter_id":     userID,
-		"muted_count":  mutedCount,
-		"expires_at":   result.ExpiresAt,
-		"timestamp":    time.Now().Unix(),
+		"muted":          result.Muted,
+		"muted_user_id":  targetID,
+		"muter_id":       userID,
+		"muted_count":    mutedCount,
+		"reason":         result.Reason,
+		"is_permanent":   isPermanent,
+		"expires_at":     expiresAt,
+		"timestamp":      time.Now().Unix(),
 	})
 }
 
@@ -143,21 +155,22 @@ func (h *MuteHandler) UnmuteUser(w http.ResponseWriter, r *http.Request) {
 	mutedCount, _ := h.muteService.GetMutedCount(r.Context(), userID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"muted":        result.Muted,
-		"muted_user_id": targetID,
-		"muter_id":     userID,
-		"muted_count":  mutedCount,
-		"timestamp":    time.Now().Unix(),
+		"muted":          result.Muted,
+		"muted_user_id":  targetID,
+		"muter_id":       userID,
+		"muted_count":    mutedCount,
+		"timestamp":      time.Now().Unix(),
 	})
 }
 
 // ToggleMute handles toggling mute status on a user.
 // @Summary Toggle mute
-// @Description Toggles mute status on a user
+// @Description Toggles mute status on a user (mute if not muted, unmute if muted)
 // @Tags mutes
 // @Security BearerAuth
 // @Param id path string true "User ID"
 // @Param duration query int false "Mute duration in hours (default 24, 0 for permanent)"
+// @Param reason query string false "Reason for muting"
 // @Success 200 {object} dto.MuteResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -196,9 +209,13 @@ func (h *MuteHandler) ToggleMute(w http.ResponseWriter, r *http.Request) {
 	} else {
 		duration, _ := strconv.Atoi(r.URL.Query().Get("duration"))
 		if duration < 0 {
-			duration = 24
+			duration = 0
 		}
-		result, err = h.muteService.MuteUser(r.Context(), userID, targetID, duration)
+		reason := r.URL.Query().Get("reason")
+		if reason != "" {
+			reason = strings.TrimSpace(reason)
+		}
+		result, err = h.muteService.MuteUser(r.Context(), userID, targetID, duration, reason)
 	}
 
 	if err != nil {
@@ -209,13 +226,22 @@ func (h *MuteHandler) ToggleMute(w http.ResponseWriter, r *http.Request) {
 	// Get updated counts
 	mutedCount, _ := h.muteService.GetMutedCount(r.Context(), userID)
 
+	isPermanent := true
+	expiresAt := ""
+	if result.ExpiresAt != nil {
+		isPermanent = false
+		expiresAt = result.ExpiresAt.Format(time.RFC3339)
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"muted":        result.Muted,
-		"muted_user_id": targetID,
-		"muter_id":     userID,
-		"muted_count":  mutedCount,
-		"expires_at":   result.ExpiresAt,
-		"timestamp":    time.Now().Unix(),
+		"muted":          result.Muted,
+		"muted_user_id":  targetID,
+		"muter_id":       userID,
+		"muted_count":    mutedCount,
+		"reason":         result.Reason,
+		"is_permanent":   isPermanent,
+		"expires_at":     expiresAt,
+		"timestamp":      time.Now().Unix(),
 	})
 }
 
@@ -249,16 +275,22 @@ func (h *MuteHandler) CheckMuteStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isMuted, expiresAt, err := h.muteService.GetMuteStatus(r.Context(), userID, targetID)
+	muteInfo, err := h.muteService.GetMuteInfo(r.Context(), userID, targetID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to check mute status")
 		return
 	}
 
+	// Get muted count
+	mutedCount, _ := h.muteService.GetMutedCount(r.Context(), userID)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"muted":      isMuted,
-		"user_id":    targetID,
-		"expires_at": expiresAt,
+		"muted":          muteInfo.Muted,
+		"user_id":        targetID,
+		"reason":         muteInfo.Reason,
+		"is_permanent":   muteInfo.IsPermanent,
+		"expires_at":     muteInfo.ExpiresAt,
+		"muted_count":    mutedCount,
 	})
 }
 
@@ -274,7 +306,9 @@ func (h *MuteHandler) CheckMuteStatus(w http.ResponseWriter, r *http.Request) {
 // @Produce json
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
-// @Param active_only query bool false "Only return currently active mutes"
+// @Param include_expired query bool false "Include expired mutes"
+// @Param search query string false "Search by username or full name"
+// @Param active_only query bool false "Only return active mutes"
 // @Success 200 {object} dto.MutedListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -291,15 +325,17 @@ func (h *MuteHandler) GetMutedUsers(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	includeExpired, _ := strconv.ParseBool(r.URL.Query().Get("include_expired"))
+	search := r.URL.Query().Get("search")
 	activeOnly, _ := strconv.ParseBool(r.URL.Query().Get("active_only"))
 
-	mutes, nextCursor, total, err := h.muteService.GetMutedUsers(r.Context(), userID, cursor, limit, activeOnly)
+	mutes, nextCursor, total, err := h.muteService.GetMutedUsers(r.Context(), userID, cursor, limit, includeExpired, search, activeOnly)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get muted users")
 		return
 	}
 
-	// Build response
+	// Build response with user details
 	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
 	for _, mute := range mutes {
 		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
@@ -308,15 +344,147 @@ func (h *MuteHandler) GetMutedUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		isActive := mute.ExpiresAt == nil || mute.ExpiresAt.After(time.Now())
 		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
-			ID:         user.ID,
-			Username:   user.Username,
-			FullName:   user.FullName,
-			AvatarURL:  user.AvatarURL,
-			Bio:        user.Bio,
-			IsVerified: user.IsVerified,
-			MutedAt:    mute.CreatedAt,
-			ExpiresAt:  mute.ExpiresAt,
-			IsActive:   isActive,
+			ID:          user.ID,
+			Username:    user.Username,
+			FullName:    user.FullName,
+			AvatarURL:   user.AvatarURL,
+			Bio:         user.Bio,
+			IsVerified:  user.IsVerified,
+			Reason:      mute.Reason,
+			MutedAt:     mute.CreatedAt,
+			ExpiresAt:   mute.ExpiresAt,
+			IsActive:    isActive,
+			IsPermanent: mute.ExpiresAt == nil,
+		})
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"data":        mutedUsers,
+		"next_cursor": nextCursor,
+		"has_more":    nextCursor != "",
+		"limit":       limit,
+		"total":       total,
+	})
+}
+
+// ======================================================================
+= Get Active Mutes
+// ======================================================================
+
+// GetActiveMutes handles retrieving currently active mutes.
+// @Summary Get active mutes
+// @Description Retrieves currently active mutes for the authenticated user
+// @Tags mutes
+// @Security BearerAuth
+// @Produce json
+// @Param cursor query string false "Pagination cursor"
+// @Param limit query int false "Items per page (default 20, max 100)"
+// @Success 200 {object} dto.MutedListResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/mutes/active [get]
+func (h *MuteHandler) GetActiveMutes(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 100 {
+		limit = 20
+	}
+
+	mutes, nextCursor, total, err := h.muteService.GetActiveMutes(r.Context(), userID, cursor, limit)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get active mutes")
+		return
+	}
+
+	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
+	for _, mute := range mutes {
+		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
+		if err != nil {
+			continue
+		}
+		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
+			ID:          user.ID,
+			Username:    user.Username,
+			FullName:    user.FullName,
+			AvatarURL:   user.AvatarURL,
+			Bio:         user.Bio,
+			IsVerified:  user.IsVerified,
+			Reason:      mute.Reason,
+			MutedAt:     mute.CreatedAt,
+			ExpiresAt:   mute.ExpiresAt,
+			IsActive:    true,
+			IsPermanent: mute.ExpiresAt == nil,
+		})
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"data":        mutedUsers,
+		"next_cursor": nextCursor,
+		"has_more":    nextCursor != "",
+		"limit":       limit,
+		"total":       total,
+	})
+}
+
+// ======================================================================
+= Get Expired Mutes
+// ======================================================================
+
+// GetExpiredMutes handles retrieving expired mutes.
+// @Summary Get expired mutes
+// @Description Retrieves expired mutes for the authenticated user
+// @Tags mutes
+// @Security BearerAuth
+// @Produce json
+// @Param cursor query string false "Pagination cursor"
+// @Param limit query int false "Items per page (default 20, max 100)"
+// @Success 200 {object} dto.MutedListResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/mutes/expired [get]
+func (h *MuteHandler) GetExpiredMutes(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 100 {
+		limit = 20
+	}
+
+	mutes, nextCursor, total, err := h.muteService.GetExpiredMutes(r.Context(), userID, cursor, limit)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get expired mutes")
+		return
+	}
+
+	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
+	for _, mute := range mutes {
+		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
+		if err != nil {
+			continue
+		}
+		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
+			ID:          user.ID,
+			Username:    user.Username,
+			FullName:    user.FullName,
+			AvatarURL:   user.AvatarURL,
+			Bio:         user.Bio,
+			IsVerified:  user.IsVerified,
+			Reason:      mute.Reason,
+			MutedAt:     mute.CreatedAt,
+			ExpiresAt:   mute.ExpiresAt,
+			IsActive:    false,
+			IsPermanent: false,
 		})
 	}
 
@@ -396,143 +564,19 @@ func (h *MuteHandler) CheckIfMuted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isMuted, expiresAt, err := h.muteService.GetMuteStatus(r.Context(), muterID, mutedID)
+	muteInfo, err := h.muteService.GetMuteInfo(r.Context(), muterID, mutedID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to check mute status")
 		return
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"muted":      isMuted,
-		"muter_id":   muterID,
-		"muted_id":   mutedID,
-		"expires_at": expiresAt,
-	})
-}
-
-// ======================================================================
-= Get Active Mutes
-// ======================================================================
-
-// GetActiveMutes handles retrieving currently active mutes.
-// @Summary Get active mutes
-// @Description Retrieves currently active mutes for the authenticated user
-// @Tags mutes
-// @Security BearerAuth
-// @Produce json
-// @Param cursor query string false "Pagination cursor"
-// @Param limit query int false "Items per page (default 20, max 100)"
-// @Success 200 {object} dto.MutedListResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/mutes/active [get]
-func (h *MuteHandler) GetActiveMutes(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	cursor := r.URL.Query().Get("cursor")
-	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil || limit < 1 || limit > 100 {
-		limit = 20
-	}
-
-	mutes, nextCursor, total, err := h.muteService.GetActiveMutes(r.Context(), userID, cursor, limit)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get active mutes")
-		return
-	}
-
-	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
-	for _, mute := range mutes {
-		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
-		if err != nil {
-			continue
-		}
-		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
-			ID:         user.ID,
-			Username:   user.Username,
-			FullName:   user.FullName,
-			AvatarURL:  user.AvatarURL,
-			Bio:        user.Bio,
-			IsVerified: user.IsVerified,
-			MutedAt:    mute.CreatedAt,
-			ExpiresAt:  mute.ExpiresAt,
-			IsActive:   true,
-		})
-	}
-
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        mutedUsers,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
-	})
-}
-
-// ======================================================================
-= Get Expired Mutes
-// ======================================================================
-
-// GetExpiredMutes handles retrieving expired mutes.
-// @Summary Get expired mutes
-// @Description Retrieves expired mutes for the authenticated user
-// @Tags mutes
-// @Security BearerAuth
-// @Produce json
-// @Param cursor query string false "Pagination cursor"
-// @Param limit query int false "Items per page (default 20, max 100)"
-// @Success 200 {object} dto.MutedListResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/mutes/expired [get]
-func (h *MuteHandler) GetExpiredMutes(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	cursor := r.URL.Query().Get("cursor")
-	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil || limit < 1 || limit > 100 {
-		limit = 20
-	}
-
-	mutes, nextCursor, total, err := h.muteService.GetExpiredMutes(r.Context(), userID, cursor, limit)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get expired mutes")
-		return
-	}
-
-	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
-	for _, mute := range mutes {
-		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
-		if err != nil {
-			continue
-		}
-		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
-			ID:         user.ID,
-			Username:   user.Username,
-			FullName:   user.FullName,
-			AvatarURL:  user.AvatarURL,
-			Bio:        user.Bio,
-			IsVerified: user.IsVerified,
-			MutedAt:    mute.CreatedAt,
-			ExpiresAt:  mute.ExpiresAt,
-			IsActive:   false,
-		})
-	}
-
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        mutedUsers,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
+		"muted":          muteInfo.Muted,
+		"muter_id":       muterID,
+		"muted_id":       mutedID,
+		"reason":         muteInfo.Reason,
+		"is_permanent":   muteInfo.IsPermanent,
+		"expires_at":     muteInfo.ExpiresAt,
 	})
 }
 
@@ -540,41 +584,27 @@ func (h *MuteHandler) GetExpiredMutes(w http.ResponseWriter, r *http.Request) {
 = Admin Endpoints
 // ======================================================================
 
-// AdminGetUserMutes handles retrieving mutes by a user (admin only).
-// @Summary Admin get user mutes
-// @Description Retrieves all mutes made by a user (admin only)
+// AdminListMutes handles admin listing of all mute relationships.
+// @Summary Admin list mutes
+// @Description Lists all mute relationships for admin moderation
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Param user_id path string true "User ID"
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
-// @Param active_only query bool false "Only return active mutes"
-// @Success 200 {object} dto.MutedListResponse
+// @Param muter_id query string false "Filter by muter ID"
+// @Param muted_id query string false "Filter by muted ID"
+// @Param active_only query bool false "Only show active mutes"
+// @Success 200 {object} dto.MuteAdminListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
-// @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
-// @Router /api/admin/mutes/user/{user_id} [get]
-func (h *MuteHandler) AdminGetUserMutes(w http.ResponseWriter, r *http.Request) {
+// @Router /api/admin/mutes [get]
+func (h *MuteHandler) AdminListMutes(w http.ResponseWriter, r *http.Request) {
 	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
 	if err != nil || role != "admin" {
 		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
-		return
-	}
-
-	vars := mux.Vars(r)
-	userID := vars["user_id"]
-	if userID == "" {
-		h.sendError(w, http.StatusBadRequest, "User ID required", nil)
-		return
-	}
-
-	// Verify user exists
-	_, err = h.userService.GetUserByID(r.Context(), userID)
-	if err != nil {
-		h.sendError(w, http.StatusNotFound, "User not found", nil)
 		return
 	}
 
@@ -583,36 +613,48 @@ func (h *MuteHandler) AdminGetUserMutes(w http.ResponseWriter, r *http.Request) 
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	muterID := r.URL.Query().Get("muter_id")
+	mutedID := r.URL.Query().Get("muted_id")
 	activeOnly, _ := strconv.ParseBool(r.URL.Query().Get("active_only"))
 
-	mutes, nextCursor, total, err := h.muteService.GetMutedUsers(r.Context(), userID, cursor, limit, activeOnly)
+	mutes, nextCursor, total, err := h.muteService.AdminListMutes(r.Context(), cursor, limit, muterID, mutedID, activeOnly)
 	if err != nil {
-		h.handleServiceError(w, err, "Failed to get user mutes")
+		h.handleServiceError(w, err, "Failed to list mutes")
 		return
 	}
 
-	mutedUsers := make([]*dto.MutedUserResponse, 0, len(mutes))
-	for _, mute := range mutes {
-		user, err := h.userService.GetUserByID(r.Context(), mute.MutedUserID)
-		if err != nil {
-			continue
-		}
-		isActive := mute.ExpiresAt == nil || mute.ExpiresAt.After(time.Now())
-		mutedUsers = append(mutedUsers, &dto.MutedUserResponse{
-			ID:         user.ID,
-			Username:   user.Username,
-			FullName:   user.FullName,
-			AvatarURL:  user.AvatarURL,
-			Bio:        user.Bio,
-			IsVerified: user.IsVerified,
-			MutedAt:    mute.CreatedAt,
-			ExpiresAt:  mute.ExpiresAt,
-			IsActive:   isActive,
+	// Build response
+	muteResponses := make([]*dto.MuteAdminResponse, 0, len(mutes))
+	for _, m := range mutes {
+		muter, _ := h.userService.GetUserByID(r.Context(), m.MuterID)
+		muted, _ := h.userService.GetUserByID(r.Context(), m.MutedUserID)
+		isActive := m.ExpiresAt == nil || m.ExpiresAt.After(time.Now())
+		muteResponses = append(muteResponses, &dto.MuteAdminResponse{
+			ID:             m.ID,
+			MuterID:        m.MuterID,
+			MutedUserID:    m.MutedUserID,
+			MuterUsername: func() string {
+				if muter != nil {
+					return muter.Username
+				}
+				return ""
+			}(),
+			MutedUsername: func() string {
+				if muted != nil {
+					return muted.Username
+				}
+				return ""
+			}(),
+			Reason:      m.Reason,
+			CreatedAt:   m.CreatedAt,
+			ExpiresAt:   m.ExpiresAt,
+			IsActive:    isActive,
+			IsPermanent: m.ExpiresAt == nil,
 		})
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        mutedUsers,
+		"data":        muteResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -625,14 +667,13 @@ func (h *MuteHandler) AdminGetUserMutes(w http.ResponseWriter, r *http.Request) 
 // @Description Deletes a mute relationship (admin only)
 // @Tags admin
 // @Security BearerAuth
-// @Param muter_id path string true "Muter user ID"
-// @Param muted_id path string true "Muted user ID"
+// @Param mute_id path string true "Mute ID"
 // @Success 200 {object} dto.SuccessResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
-// @Router /api/admin/mutes/{muter_id}/{muted_id} [delete]
+// @Router /api/admin/mutes/{mute_id} [delete]
 func (h *MuteHandler) AdminDeleteMute(w http.ResponseWriter, r *http.Request) {
 	// Check admin role
 	role, err := middleware.GetUserRole(r.Context())
@@ -642,15 +683,13 @@ func (h *MuteHandler) AdminDeleteMute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vars := mux.Vars(r)
-	muterID := vars["muter_id"]
-	mutedID := vars["muted_id"]
-
-	if muterID == "" || mutedID == "" {
-		h.sendError(w, http.StatusBadRequest, "muter_id and muted_id are required", nil)
+	muteID := vars["mute_id"]
+	if muteID == "" {
+		h.sendError(w, http.StatusBadRequest, "Mute ID required", nil)
 		return
 	}
 
-	if err := h.muteService.AdminDeleteMute(r.Context(), muterID, mutedID); err != nil {
+	if err := h.muteService.AdminDeleteMute(r.Context(), muteID); err != nil {
 		h.handleServiceError(w, err, "Failed to delete mute")
 		return
 	}
@@ -667,6 +706,7 @@ func (h *MuteHandler) AdminDeleteMute(w http.ResponseWriter, r *http.Request) {
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
 // @Success 200 {object} dto.MuteStatsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
@@ -680,7 +720,12 @@ func (h *MuteHandler) AdminGetMuteStats(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	stats, err := h.muteService.AdminGetMuteStats(r.Context())
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	stats, err := h.muteService.AdminGetMuteStats(r.Context(), days)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get mute stats")
 		return
@@ -743,6 +788,8 @@ func (h *MuteHandler) handleServiceError(w http.ResponseWriter, err error, defau
 		h.sendError(w, http.StatusBadRequest, "Invalid mute ID", nil)
 	case errors.Is(err, service.ErrMuteExpired):
 		h.sendError(w, http.StatusBadRequest, "Mute has expired", nil)
+	case errors.Is(err, service.ErrMuteDurationInvalid):
+		h.sendError(w, http.StatusBadRequest, "Invalid mute duration", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
