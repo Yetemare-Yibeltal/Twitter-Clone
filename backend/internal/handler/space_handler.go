@@ -23,7 +23,7 @@ import (
 // SpaceHandler handles all audio space-related HTTP endpoints.
 type SpaceHandler struct {
 	spaceService service.SpaceService
-	wsHub        *WebSocketHub
+	userService  service.UserService
 	upgrader     websocket.Upgrader
 	log          *logrus.Entry
 }
@@ -31,11 +31,11 @@ type SpaceHandler struct {
 // NewSpaceHandler creates a new space handler.
 func NewSpaceHandler(
 	spaceService service.SpaceService,
-	wsHub *WebSocketHub,
+	userService service.UserService,
 ) *SpaceHandler {
 	return &SpaceHandler{
 		spaceService: spaceService,
-		wsHub:        wsHub,
+		userService:  userService,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -122,7 +122,19 @@ func (h *SpaceHandler) GetSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, space)
+	// Get participant count
+	participantCount, _ := h.spaceService.GetParticipantCount(r.Context(), spaceID)
+
+	// Get space status
+	status, _ := h.spaceService.GetSpaceStatus(r.Context(), spaceID)
+
+	response := &dto.SpaceDetailResponse{
+		Space:            space,
+		ParticipantCount: participantCount,
+		Status:           status,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // ======================================================================
@@ -138,6 +150,7 @@ func (h *SpaceHandler) GetSpace(w http.ResponseWriter, r *http.Request) {
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param status query string false "Filter by status (active, ended, scheduled)"
 // @Param user_id query string false "Filter by creator user ID"
+// @Param is_public query bool false "Filter by public/private"
 // @Success 200 {object} dto.SpaceListResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/spaces [get]
@@ -149,10 +162,12 @@ func (h *SpaceHandler) ListSpaces(w http.ResponseWriter, r *http.Request) {
 	}
 	status := r.URL.Query().Get("status")
 	userID := r.URL.Query().Get("user_id")
+	isPublic := r.URL.Query().Get("is_public")
+	isPublicBool, _ := strconv.ParseBool(isPublic)
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	spaces, nextCursor, total, err := h.spaceService.ListSpaces(r.Context(), cursor, limit, status, userID, currentUserID)
+	spaces, nextCursor, total, err := h.spaceService.ListSpaces(r.Context(), cursor, limit, status, userID, isPublicBool, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to list spaces")
 		return
@@ -177,6 +192,7 @@ func (h *SpaceHandler) ListSpaces(w http.ResponseWriter, r *http.Request) {
 // @Tags spaces
 // @Produce json
 // @Param limit query int false "Items per page (default 10, max 50)"
+// @Param include_scheduled query bool false "Include scheduled spaces"
 // @Success 200 {object} dto.SpaceListResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/spaces/active [get]
@@ -185,10 +201,11 @@ func (h *SpaceHandler) GetActiveSpaces(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 50 {
 		limit = 10
 	}
+	includeScheduled, _ := strconv.ParseBool(r.URL.Query().Get("include_scheduled"))
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	spaces, err := h.spaceService.GetActiveSpaces(r.Context(), limit, currentUserID)
+	spaces, err := h.spaceService.GetActiveSpaces(r.Context(), limit, includeScheduled, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get active spaces")
 		return
@@ -210,9 +227,11 @@ func (h *SpaceHandler) GetActiveSpaces(w http.ResponseWriter, r *http.Request) {
 // @Tags spaces
 // @Security BearerAuth
 // @Param id path string true "Space ID"
+// @Param role query string false "Role (listener, speaker) default listener"
 // @Success 200 {object} dto.SpaceJoinResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/spaces/{id}/join [post]
@@ -230,23 +249,30 @@ func (h *SpaceHandler) JoinSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	space, err := h.spaceService.JoinSpace(r.Context(), spaceID, userID)
+	role := r.URL.Query().Get("role")
+	if role == "" {
+		role = "listener"
+	}
+
+	result, err := h.spaceService.JoinSpace(r.Context(), spaceID, userID, role)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to join space")
 		return
 	}
 
-	// Notify other participants via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "participant_joined",
-			"user_id": userID,
-			"space_id": spaceID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
+	// Get space details for WebSocket connection info
+	space, _ := h.spaceService.GetSpace(r.Context(), spaceID, userID)
+	participantCount, _ := h.spaceService.GetParticipantCount(r.Context(), spaceID)
 
-	h.sendSuccess(w, http.StatusOK, space)
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"success":          true,
+		"message":          "Joined space successfully",
+		"space_id":         spaceID,
+		"role":             role,
+		"participant_count": participantCount,
+		"ws_endpoint":      fmt.Sprintf("/ws/spaces/%s", spaceID),
+		"space":            space,
+	})
 }
 
 // ======================================================================
@@ -262,6 +288,7 @@ func (h *SpaceHandler) JoinSpace(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} dto.SuccessResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/spaces/{id}/leave [post]
@@ -284,19 +311,14 @@ func (h *SpaceHandler) LeaveSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify other participants via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "participant_left",
-			"user_id": userID,
-			"space_id": spaceID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
+	// Get updated participant count
+	participantCount, _ := h.spaceService.GetParticipantCount(r.Context(), spaceID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Left space successfully",
+		"success":          true,
+		"message":          "Left space successfully",
+		"space_id":         spaceID,
+		"participant_count": participantCount,
 	})
 }
 
@@ -311,6 +333,7 @@ func (h *SpaceHandler) LeaveSpace(w http.ResponseWriter, r *http.Request) {
 // @Security BearerAuth
 // @Param id path string true "Space ID"
 // @Success 200 {object} dto.SuccessResponse
+// @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
@@ -335,18 +358,10 @@ func (h *SpaceHandler) EndSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify all participants via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "space_ended",
-			"space_id": spaceID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
-
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Space ended successfully",
+		"space_id": spaceID,
 	})
 }
 
@@ -356,7 +371,7 @@ func (h *SpaceHandler) EndSpace(w http.ResponseWriter, r *http.Request) {
 
 // ToggleMute handles muting/unmuting a participant.
 // @Summary Toggle mute
-// @Description Mutes or unmutes a participant in a space
+// @Description Mutes or unmutes a participant in a space (host/admin only)
 // @Tags spaces
 // @Security BearerAuth
 // @Param id path string true "Space ID"
@@ -394,20 +409,12 @@ func (h *SpaceHandler) ToggleMute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify all participants via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "mute_toggled",
-			"space_id": spaceID,
-			"user_id": targetUserID,
-			"muted": mute,
-			"timestamp": time.Now().Unix(),
-		})
-	}
-
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Mute toggled successfully",
+		"success":     true,
+		"message":     "Mute toggled successfully",
+		"space_id":    spaceID,
+		"user_id":     targetUserID,
+		"muted":       mute,
 	})
 }
 
@@ -453,19 +460,15 @@ func (h *SpaceHandler) RemoveParticipant(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Notify removed participant and others via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "participant_removed",
-			"space_id": spaceID,
-			"user_id": targetUserID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
+	// Get updated participant count
+	participantCount, _ := h.spaceService.GetParticipantCount(r.Context(), spaceID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Participant removed successfully",
+		"success":          true,
+		"message":          "Participant removed successfully",
+		"space_id":         spaceID,
+		"user_id":          targetUserID,
+		"participant_count": participantCount,
 	})
 }
 
@@ -475,13 +478,13 @@ func (h *SpaceHandler) RemoveParticipant(w http.ResponseWriter, r *http.Request)
 
 // InviteToSpace handles inviting a user to a space.
 // @Summary Invite to space
-// @Description Invites a user to join an audio space
+// @Description Invites a user to join an audio space (host/admin only)
 // @Tags spaces
 // @Security BearerAuth
 // @Accept json
 // @Produce json
 // @Param id path string true "Space ID"
-// @Param request body dto.InviteRequest true "Invite details"
+// @Param request body dto.InviteToSpaceRequest true "Invite details"
 // @Success 200 {object} dto.SuccessResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -503,7 +506,7 @@ func (h *SpaceHandler) InviteToSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req dto.InviteRequest
+	var req dto.InviteToSpaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.sendError(w, http.StatusBadRequest, "Invalid request body", nil)
 		return
@@ -514,24 +517,23 @@ func (h *SpaceHandler) InviteToSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify invited user exists
+	_, err = h.userService.GetUserByID(r.Context(), req.UserID)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
+		return
+	}
+
 	if err := h.spaceService.InviteToSpace(r.Context(), spaceID, userID, req.UserID); err != nil {
 		h.handleServiceError(w, err, "Failed to invite user")
 		return
 	}
 
-	// Send notification to invited user via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToUser(req.UserID, map[string]interface{}{
-			"type": "space_invite",
-			"space_id": spaceID,
-			"inviter_id": userID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
-
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Invitation sent successfully",
+		"space_id": spaceID,
+		"user_id":  req.UserID,
 	})
 }
 
@@ -547,6 +549,7 @@ func (h *SpaceHandler) InviteToSpace(w http.ResponseWriter, r *http.Request) {
 // @Param id path string true "Space ID"
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param role query string false "Filter by role (host, speaker, listener)"
 // @Success 200 {object} dto.ParticipantListResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -564,15 +567,37 @@ func (h *SpaceHandler) GetSpaceParticipants(w http.ResponseWriter, r *http.Reque
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	role := r.URL.Query().Get("role")
 
-	participants, nextCursor, total, err := h.spaceService.GetSpaceParticipants(r.Context(), spaceID, cursor, limit)
+	currentUserID, _ := middleware.GetUserID(r.Context())
+
+	participants, nextCursor, total, err := h.spaceService.GetSpaceParticipants(r.Context(), spaceID, cursor, limit, role, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get participants")
 		return
 	}
 
+	// Build response with user details
+	participantResponses := make([]*dto.ParticipantResponse, 0, len(participants))
+	for _, p := range participants {
+		user, err := h.userService.GetUserByID(r.Context(), p.UserID)
+		if err != nil {
+			continue
+		}
+		participantResponses = append(participantResponses, &dto.ParticipantResponse{
+			UserID:     p.UserID,
+			Username:   user.Username,
+			FullName:   user.FullName,
+			AvatarURL:  user.AvatarURL,
+			Role:       p.Role,
+			IsMuted:    p.IsMuted,
+			JoinedAt:   p.JoinedAt,
+			IsHost:     p.IsHost,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        participants,
+		"data":        participantResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -614,7 +639,7 @@ func (h *SpaceHandler) GetUserSpaceStats(w http.ResponseWriter, r *http.Request)
 = WebSocket Connection for Space
 // ======================================================================
 
-// ServeWS handles WebSocket connections for audio spaces.
+// ServeWebSocket handles WebSocket connections for audio spaces.
 // @Summary WebSocket for space
 // @Description Establishes a WebSocket connection for real-time space audio
 // @Tags spaces
@@ -623,10 +648,11 @@ func (h *SpaceHandler) GetUserSpaceStats(w http.ResponseWriter, r *http.Request)
 // @Success 101 "Switching Protocols"
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
 // @Failure 404 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
-// @Router /api/spaces/{id}/ws [get]
-func (h *SpaceHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
+// @Router /ws/spaces/{id} [get]
+func (h *SpaceHandler) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 	userID, err := middleware.GetUserID(r.Context())
 	if err != nil {
 		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
@@ -640,10 +666,17 @@ func (h *SpaceHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify user is a participant or host
+	// Verify user is a participant
 	isParticipant, err := h.spaceService.IsParticipant(r.Context(), spaceID, userID)
 	if err != nil || !isParticipant {
 		h.sendError(w, http.StatusForbidden, "Not a participant of this space", nil)
+		return
+	}
+
+	// Verify space is active
+	status, err := h.spaceService.GetSpaceStatus(r.Context(), spaceID)
+	if err != nil || status != "active" {
+		h.sendError(w, http.StatusBadRequest, "Space is not active", nil)
 		return
 	}
 
@@ -653,212 +686,89 @@ func (h *SpaceHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		h.log.WithError(err).Error("Failed to upgrade to WebSocket")
 		return
 	}
+	defer conn.Close()
 
-	// Create WebSocket client for this space
-	client := &SpaceWebSocketClient{
-		ID:      userID,
-		SpaceID: spaceID,
-		Conn:    conn,
-		Hub:     h.wsHub,
-		Send:    make(chan []byte, 256),
-		Handler: h,
-	}
-
-	// Register client with WebSocket hub
-	if h.wsHub != nil {
-		h.wsHub.RegisterSpaceClient(spaceID, client)
-	}
-
-	// Add to space room
-	if h.wsHub != nil {
-		h.wsHub.JoinRoom("space:"+spaceID, conn)
-	}
-
-	// Notify others in the space
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "user_connected",
-			"user_id": userID,
-			"space_id": spaceID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
-
-	// Start goroutines
-	go h.writePump(client)
-	go h.readPump(client)
-
-	h.log.WithFields(logrus.Fields{
-		"user_id":  userID,
-		"space_id": spaceID,
-	}).Info("WebSocket connected for space")
+	// Handle WebSocket messages
+	h.handleWebSocketConnection(conn, spaceID, userID)
 }
 
 // ======================================================================
-= WebSocket Client Management
+= WebSocket Connection Handler
 // ======================================================================
 
-// SpaceWebSocketClient represents a WebSocket client for a space.
-type SpaceWebSocketClient struct {
-	ID      string
-	SpaceID string
-	Conn    *websocket.Conn
-	Hub     *WebSocketHub
-	Send    chan []byte
-	Handler *SpaceHandler
-}
-
-// readPump reads messages from the WebSocket connection.
-func (h *SpaceHandler) readPump(client *SpaceWebSocketClient) {
-	defer func() {
-		client.Conn.Close()
-		if h.wsHub != nil {
-			h.wsHub.UnregisterSpaceClient(client.SpaceID, client)
-		}
-	}()
-
-	client.Conn.SetReadLimit(512 * 1024)
-	client.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	client.Conn.SetPongHandler(func(string) error {
-		client.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+// handleWebSocketConnection handles a WebSocket connection.
+func (h *SpaceHandler) handleWebSocketConnection(conn *websocket.Conn, spaceID, userID string) {
+	// Set read/write deadlines
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
 
+	// Send initial connection confirmation
+	h.sendWSMessage(conn, map[string]interface{}{
+		"type":    "connected",
+		"space_id": spaceID,
+		"user_id": userID,
+	})
+
+	// Message loop
 	for {
-		_, message, err := client.Conn.ReadMessage()
-		if err != nil {
+		var msg map[string]interface{}
+		if err := conn.ReadJSON(&msg); err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				h.log.WithError(err).Warn("WebSocket read error")
+			}
 			break
 		}
 
-		// Process message
-		h.handleSpaceMessage(client, message)
-	}
-}
+		msgType, _ := msg["type"].(string)
 
-// writePump writes messages to the WebSocket connection.
-func (h *SpaceHandler) writePump(client *SpaceWebSocketClient) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer func() {
-		ticker.Stop()
-		client.Conn.Close()
-	}()
+		switch msgType {
+		case "ping":
+			h.sendWSMessage(conn, map[string]interface{}{
+				"type": "pong",
+				"timestamp": time.Now().Unix(),
+			})
 
-	for {
-		select {
-		case message, ok := <-client.Send:
-			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if !ok {
-				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
+		case "audio":
+			// Forward audio data to other participants
+			h.spaceService.BroadcastAudio(spaceID, userID, msg)
+
+		case "speaker_status":
+			// Update speaker status
+			speaking, _ := msg["speaking"].(bool)
+			if err := h.spaceService.UpdateSpeakerStatus(spaceID, userID, speaking); err != nil {
+				h.log.WithError(err).Warn("Failed to update speaker status")
 			}
 
-			w, err := client.Conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-
-			// Add queued messages
-			n := len(client.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-client.Send)
+		case "raise_hand":
+			if err := h.spaceService.RaiseHand(spaceID, userID); err != nil {
+				h.log.WithError(err).Warn("Failed to raise hand")
 			}
 
-			if err := w.Close(); err != nil {
-				return
+		case "lower_hand":
+			if err := h.spaceService.LowerHand(spaceID, userID); err != nil {
+				h.log.WithError(err).Warn("Failed to lower hand")
 			}
-		case <-ticker.C:
-			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
+
+		case "audio_settings":
+			// Update audio settings (volume, bitrate, etc.)
+			settings, _ := msg["settings"].(map[string]interface{})
+			if err := h.spaceService.UpdateAudioSettings(spaceID, userID, settings); err != nil {
+				h.log.WithError(err).Warn("Failed to update audio settings")
 			}
+
+		default:
+			h.log.WithField("type", msgType).Debug("Unknown WebSocket message type")
 		}
 	}
 }
 
-// handleSpaceMessage processes incoming WebSocket messages for a space.
-func (h *SpaceHandler) handleSpaceMessage(client *SpaceWebSocketClient, data []byte) {
-	var msg map[string]interface{}
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return
-	}
-
-	msgType, ok := msg["type"].(string)
-	if !ok {
-		return
-	}
-
-	switch msgType {
-	case "ping":
-		h.sendSpaceMessage(client, map[string]interface{}{
-			"type": "pong",
-			"timestamp": time.Now().Unix(),
-		})
-
-	case "audio":
-		// Forward audio data to other participants
-		if h.wsHub != nil {
-			h.wsHub.BroadcastToRoom("space:"+client.SpaceID, map[string]interface{}{
-				"type": "audio",
-				"user_id": client.ID,
-				"data": msg["data"],
-				"timestamp": time.Now().Unix(),
-			})
-		}
-
-	case "raise_hand":
-		if h.wsHub != nil {
-			h.wsHub.BroadcastToRoom("space:"+client.SpaceID, map[string]interface{}{
-				"type": "hand_raised",
-				"user_id": client.ID,
-				"timestamp": time.Now().Unix(),
-			})
-		}
-
-	case "lower_hand":
-		if h.wsHub != nil {
-			h.wsHub.BroadcastToRoom("space:"+client.SpaceID, map[string]interface{}{
-				"type": "hand_lowered",
-				"user_id": client.ID,
-				"timestamp": time.Now().Unix(),
-			})
-		}
-
-	case "speaker_status":
-		if h.wsHub != nil {
-			h.wsHub.BroadcastToRoom("space:"+client.SpaceID, map[string]interface{}{
-				"type": "speaker_status",
-				"user_id": client.ID,
-				"speaking": msg["speaking"],
-				"timestamp": time.Now().Unix(),
-			})
-		}
-
-	case "audio_settings":
-		// Update audio settings (volume, etc.)
-		// Store in user session
-		h.log.WithFields(logrus.Fields{
-			"user_id": client.ID,
-			"space_id": client.SpaceID,
-		}).Debug("Audio settings updated")
-
-	default:
-		h.log.WithField("type", msgType).Debug("Unknown WebSocket message type")
-	}
-}
-
-// sendSpaceMessage sends a message to a space client.
-func (h *SpaceHandler) sendSpaceMessage(client *SpaceWebSocketClient, data interface{}) {
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		h.log.WithError(err).Error("Failed to marshal message")
-		return
-	}
-	select {
-	case client.Send <- bytes:
-	default:
-		h.log.WithField("user_id", client.ID).Warn("Client send channel full")
+// sendWSMessage sends a message to the WebSocket connection.
+func (h *SpaceHandler) sendWSMessage(conn *websocket.Conn, data interface{}) {
+	if err := conn.WriteJSON(data); err != nil {
+		h.log.WithError(err).Warn("Failed to send WebSocket message")
 	}
 }
 
@@ -876,7 +786,8 @@ func (h *SpaceHandler) sendSpaceMessage(client *SpaceWebSocketClient, data inter
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param status query string false "Filter by status (active, ended, scheduled)"
 // @Param search query string false "Search by title or description"
-// @Success 200 {object} dto.SpaceListResponse
+// @Param created_by query string false "Filter by creator ID"
+// @Success 200 {object} dto.SpaceAdminListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -896,15 +807,42 @@ func (h *SpaceHandler) AdminListSpaces(w http.ResponseWriter, r *http.Request) {
 	}
 	status := r.URL.Query().Get("status")
 	search := r.URL.Query().Get("search")
+	createdBy := r.URL.Query().Get("created_by")
 
-	spaces, nextCursor, total, err := h.spaceService.AdminListSpaces(r.Context(), cursor, limit, status, search)
+	spaces, nextCursor, total, err := h.spaceService.AdminListSpaces(r.Context(), cursor, limit, status, search, createdBy)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to list spaces")
 		return
 	}
 
+	// Build admin response
+	responses := make([]*dto.SpaceAdminResponse, 0, len(spaces))
+	for _, s := range spaces {
+		creator, _ := h.userService.GetUserByID(r.Context(), s.CreatedBy)
+		responses = append(responses, &dto.SpaceAdminResponse{
+			ID:          s.ID,
+			Title:       s.Title,
+			Description: s.Description,
+			Status:      s.Status,
+			CreatedBy:   s.CreatedBy,
+			CreatorUsername: func() string {
+				if creator != nil {
+					return creator.Username
+				}
+				return ""
+			}(),
+			ParticipantCount: s.ParticipantCount,
+			IsPublic:         s.IsPublic,
+			StartedAt:        s.StartedAt,
+			EndedAt:          s.EndedAt,
+			CreatedAt:        s.CreatedAt,
+			UpdatedAt:        s.UpdatedAt,
+			DeletedAt:        s.DeletedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        spaces,
+		"data":        responses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -944,18 +882,10 @@ func (h *SpaceHandler) AdminEndSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify all participants via WebSocket
-	if h.wsHub != nil {
-		h.wsHub.BroadcastToRoom("space:"+spaceID, map[string]interface{}{
-			"type": "space_ended",
-			"space_id": spaceID,
-			"timestamp": time.Now().Unix(),
-		})
-	}
-
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Space ended successfully",
+		"space_id": spaceID,
 	})
 }
 
@@ -965,7 +895,8 @@ func (h *SpaceHandler) AdminEndSpace(w http.ResponseWriter, r *http.Request) {
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Success 200 {object} dto.GlobalSpaceStatsResponse
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.SpaceGlobalStatsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -978,7 +909,12 @@ func (h *SpaceHandler) AdminGetSpaceStats(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	stats, err := h.spaceService.AdminGetSpaceStats(r.Context())
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	stats, err := h.spaceService.AdminGetSpaceStats(r.Context(), days)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get space stats")
 		return
@@ -1051,6 +987,20 @@ func (h *SpaceHandler) handleServiceError(w http.ResponseWriter, err error, defa
 		h.sendError(w, http.StatusBadRequest, "Space title is required", nil)
 	case errors.Is(err, service.ErrSpaceTitleTooLong):
 		h.sendError(w, http.StatusBadRequest, "Space title is too long", nil)
+	case errors.Is(err, service.ErrSpaceDescriptionTooLong):
+		h.sendError(w, http.StatusBadRequest, "Space description is too long", nil)
+	case errors.Is(err, service.ErrSpaceMaxParticipantsExceeded):
+		h.sendError(w, http.StatusBadRequest, "Maximum participants exceeded", nil)
+	case errors.Is(err, service.ErrSpaceDurationTooLong):
+		h.sendError(w, http.StatusBadRequest, "Space duration is too long", nil)
+	case errors.Is(err, service.ErrSpaceStartTimeInvalid):
+		h.sendError(w, http.StatusBadRequest, "Invalid start time", nil)
+	case errors.Is(err, service.ErrSpaceEndTimeInvalid):
+		h.sendError(w, http.StatusBadRequest, "Invalid end time", nil)
+	case errors.Is(err, service.ErrSpaceRecordingFailed):
+		h.sendError(w, http.StatusInternalServerError, "Failed to record space", nil)
+	case errors.Is(err, service.ErrUserNotFound):
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
