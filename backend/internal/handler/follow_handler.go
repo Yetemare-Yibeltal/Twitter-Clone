@@ -21,10 +21,10 @@ import (
 
 // FollowHandler handles all follow-related HTTP endpoints.
 type FollowHandler struct {
-	followService service.FollowService
-	userService   service.UserService
+	followService       service.FollowService
+	userService         service.UserService
 	notificationService service.NotificationService
-	log           *logrus.Entry
+	log                 *logrus.Entry
 }
 
 // NewFollowHandler creates a new follow handler.
@@ -89,12 +89,12 @@ func (h *FollowHandler) Follow(w http.ResponseWriter, r *http.Request) {
 	following, _ := h.followService.GetFollowCounts(r.Context(), userID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"following": result.Following,
-		"followee_id": targetID,
-		"follower_id": userID,
-		"follower_count": followers.Followers,
+		"following":       result.Following,
+		"followee_id":     targetID,
+		"follower_id":     userID,
+		"follower_count":  followers.Followers,
 		"following_count": following.Following,
-		"timestamp": time.Now().Unix(),
+		"timestamp":       time.Now().Unix(),
 	})
 }
 
@@ -140,12 +140,12 @@ func (h *FollowHandler) Unfollow(w http.ResponseWriter, r *http.Request) {
 	following, _ := h.followService.GetFollowCounts(r.Context(), userID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"following": result.Following,
-		"followee_id": targetID,
-		"follower_id": userID,
-		"follower_count": followers.Followers,
+		"following":       result.Following,
+		"followee_id":     targetID,
+		"follower_id":     userID,
+		"follower_count":  followers.Followers,
 		"following_count": following.Following,
-		"timestamp": time.Now().Unix(),
+		"timestamp":       time.Now().Unix(),
 	})
 }
 
@@ -204,12 +204,12 @@ func (h *FollowHandler) ToggleFollow(w http.ResponseWriter, r *http.Request) {
 	following, _ := h.followService.GetFollowCounts(r.Context(), userID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"following": result.Following,
-		"followee_id": targetID,
-		"follower_id": userID,
-		"follower_count": followers.Followers,
+		"following":       result.Following,
+		"followee_id":     targetID,
+		"follower_id":     userID,
+		"follower_count":  followers.Followers,
 		"following_count": following.Following,
-		"timestamp": time.Now().Unix(),
+		"timestamp":       time.Now().Unix(),
 	})
 }
 
@@ -254,9 +254,9 @@ func (h *FollowHandler) CheckFollowStatus(w http.ResponseWriter, r *http.Request
 	following, _ := h.followService.GetFollowCounts(r.Context(), targetID)
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"following": isFollowing,
-		"mutual": isMutual,
-		"user_id": targetID,
+		"following":      isFollowing,
+		"mutual":         isMutual,
+		"user_id":        targetID,
 		"follower_count": followers.Followers,
 		"following_count": following.Following,
 	})
@@ -483,7 +483,7 @@ func (h *FollowHandler) GetFollowSuggestions(w http.ResponseWriter, r *http.Requ
 }
 
 // ======================================================================
-= Get Follow Stats (User)
+= Get User Follow Stats
 // ======================================================================
 
 // GetUserFollowStats handles retrieving follow statistics for the user.
@@ -513,56 +513,7 @@ func (h *FollowHandler) GetUserFollowStats(w http.ResponseWriter, r *http.Reques
 }
 
 // ======================================================================
-= Get Followers with Mutual Status
-// ======================================================================
-
-// GetFollowersWithMutual handles retrieving followers with mutual status.
-// @Summary Get followers with mutual status
-// @Description Retrieves followers of a user with mutual status indicator
-// @Tags follows
-// @Produce json
-// @Param id path string true "User ID"
-// @Param cursor query string false "Pagination cursor"
-// @Param limit query int false "Items per page (default 20, max 100)"
-// @Success 200 {object} dto.MutualFollowersResponse
-// @Failure 404 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/follows/{id}/followers-mutual [get]
-func (h *FollowHandler) GetFollowersWithMutual(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	userID := vars["id"]
-	if userID == "" {
-		h.sendError(w, http.StatusBadRequest, "User ID required", nil)
-		return
-	}
-
-	cursor := r.URL.Query().Get("cursor")
-	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil || limit < 1 || limit > 100 {
-		limit = 20
-	}
-
-	currentUserID, _ := middleware.GetUserID(r.Context())
-
-	// Get followers with mutual status
-	followers, nextCursor, total, err := h.followService.GetFollowersWithMutual(r.Context(), userID, cursor, limit, currentUserID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get followers with mutual")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        followers,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
-		"user_id":     userID,
-	})
-}
-
-// ======================================================================
-= Check If User Follows (Public)
+= Check If Follows (Public)
 // ======================================================================
 
 // CheckIfFollows handles checking if user A follows user B (public).
@@ -592,7 +543,7 @@ func (h *FollowHandler) CheckIfFollows(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"following":  isFollowing,
+		"following":   isFollowing,
 		"follower_id": followerID,
 		"followee_id": followeeID,
 	})
@@ -639,8 +590,33 @@ func (h *FollowHandler) AdminListFollows(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Build response
+	followResponses := make([]*dto.FollowAdminResponse, 0, len(follows))
+	for _, f := range follows {
+		follower, _ := h.userService.GetUserByID(r.Context(), f.FollowerID)
+		followee, _ := h.userService.GetUserByID(r.Context(), f.FolloweeID)
+		followResponses = append(followResponses, &dto.FollowAdminResponse{
+			ID:           f.ID,
+			FollowerID:   f.FollowerID,
+			FolloweeID:   f.FolloweeID,
+			FollowerUsername: func() string {
+				if follower != nil {
+					return follower.Username
+				}
+				return ""
+			}(),
+			FolloweeUsername: func() string {
+				if followee != nil {
+					return followee.Username
+				}
+				return ""
+			}(),
+			CreatedAt: f.CreatedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        follows,
+		"data":        followResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
