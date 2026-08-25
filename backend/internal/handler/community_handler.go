@@ -81,6 +81,11 @@ func (h *CommunityHandler) CreateCommunity(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Add creator as owner
+	if err := h.communityService.AddMember(r.Context(), community.ID, userID, "owner"); err != nil {
+		h.log.WithError(err).Warn("Failed to add creator as owner")
+	}
+
 	h.sendSuccess(w, http.StatusCreated, community)
 }
 
@@ -110,7 +115,31 @@ func (h *CommunityHandler) GetCommunity(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, community)
+	// Get member count
+	memberCount, _ := h.communityService.GetMemberCount(r.Context(), community.ID)
+
+	// Get post count
+	postCount, _ := h.communityService.GetPostCount(r.Context(), community.ID)
+
+	// Check if current user is a member
+	isMember := false
+	if currentUserID != "" {
+		isMember, _ = h.communityService.IsMember(r.Context(), community.ID, currentUserID)
+	}
+	isAdmin := false
+	if currentUserID != "" {
+		isAdmin, _ = h.communityService.IsAdmin(r.Context(), community.ID, currentUserID)
+	}
+
+	response := &dto.CommunityDetailResponse{
+		Community:   community,
+		MemberCount: memberCount,
+		PostCount:   postCount,
+		IsMember:    isMember,
+		IsAdmin:     isAdmin,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // UpdateCommunity handles updating a community.
@@ -322,9 +351,13 @@ func (h *CommunityHandler) JoinCommunity(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Get updated member count
+	memberCount, _ := h.communityService.GetMemberCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Joined community successfully",
+		"success":       true,
+		"message":       "Joined community successfully",
+		"member_count":  memberCount,
 	})
 }
 
@@ -360,9 +393,13 @@ func (h *CommunityHandler) LeaveCommunity(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Get updated member count
+	memberCount, _ := h.communityService.GetMemberCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Left community successfully",
+		"success":       true,
+		"message":       "Left community successfully",
+		"member_count":  memberCount,
 	})
 }
 
@@ -400,8 +437,26 @@ func (h *CommunityHandler) GetCommunityMembers(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Build response with user details
+	memberResponses := make([]*dto.MemberResponse, 0, len(members))
+	for _, m := range members {
+		user, err := h.userService.GetUserByID(r.Context(), m.UserID)
+		if err != nil {
+			continue
+		}
+		memberResponses = append(memberResponses, &dto.MemberResponse{
+			UserID:     m.UserID,
+			Username:   user.Username,
+			FullName:   user.FullName,
+			AvatarURL:  user.AvatarURL,
+			Role:       m.Role,
+			JoinedAt:   m.JoinedAt,
+			IsActive:   m.IsActive,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        members,
+		"data":        memberResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -504,14 +559,18 @@ func (h *CommunityHandler) RemoveMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get updated member count
+	memberCount, _ := h.communityService.GetMemberCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Member removed successfully",
+		"success":       true,
+		"message":       "Member removed successfully",
+		"member_count":  memberCount,
 	})
 }
 
 // ======================================================================
-// Moderation - Bans
+= Moderation - Bans
 // ======================================================================
 
 // BanUser handles banning a user from a community.
@@ -566,9 +625,13 @@ func (h *CommunityHandler) BanUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get updated member count
+	memberCount, _ := h.communityService.GetMemberCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "User banned successfully",
+		"success":       true,
+		"message":       "User banned successfully",
+		"member_count":  memberCount,
 	})
 }
 
@@ -655,8 +718,26 @@ func (h *CommunityHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Build response with user details
+	bannedResponses := make([]*dto.BannedUserResponse, 0, len(bans))
+	for _, b := range bans {
+		user, err := h.userService.GetUserByID(r.Context(), b.UserID)
+		if err != nil {
+			continue
+		}
+		bannedResponses = append(bannedResponses, &dto.BannedUserResponse{
+			UserID:     b.UserID,
+			Username:   user.Username,
+			FullName:   user.FullName,
+			AvatarURL:  user.AvatarURL,
+			Reason:     b.Reason,
+			BannedAt:   b.BannedAt,
+			BannedBy:   b.BannedBy,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        bans,
+		"data":        bannedResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -714,9 +795,13 @@ func (h *CommunityHandler) AddPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get updated post count
+	postCount, _ := h.communityService.GetPostCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"message": "Post added successfully",
+		"success":     true,
+		"message":     "Post added successfully",
+		"post_count":  postCount,
 	})
 }
 
@@ -757,9 +842,13 @@ func (h *CommunityHandler) RemovePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get updated post count
+	postCount, _ := h.communityService.GetPostCount(r.Context(), identifier)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Post removed successfully",
+		"success":     true,
+		"message":     "Post removed successfully",
+		"post_count":  postCount,
 	})
 }
 
@@ -797,8 +886,31 @@ func (h *CommunityHandler) GetCommunityPosts(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Build response with tweet details
+	postResponses := make([]*dto.PostResponse, 0, len(posts))
+	for _, p := range posts {
+		// Get tweet details
+		tweet, err := h.tweetService.GetTweetByID(r.Context(), p.TweetID)
+		if err != nil {
+			continue
+		}
+		user, err := h.userService.GetUserByID(r.Context(), tweet.UserID)
+		if err != nil {
+			continue
+		}
+		postResponses = append(postResponses, &dto.PostResponse{
+			ID:        p.ID,
+			TweetID:   p.TweetID,
+			Content:   tweet.Content,
+			Username:  user.Username,
+			FullName:  user.FullName,
+			AvatarURL: user.AvatarURL,
+			CreatedAt: p.CreatedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        posts,
+		"data":        postResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -878,8 +990,33 @@ func (h *CommunityHandler) AdminListCommunities(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Build response with admin details
+	communityResponses := make([]*dto.CommunityAdminResponse, 0, len(communities))
+	for _, c := range communities {
+		creator, _ := h.userService.GetUserByID(r.Context(), c.CreatedBy)
+		communityResponses = append(communityResponses, &dto.CommunityAdminResponse{
+			ID:          c.ID,
+			Name:        c.Name,
+			Slug:        c.Slug,
+			Description: c.Description,
+			IsPrivate:   c.IsPrivate,
+			MemberCount: c.MemberCount,
+			PostCount:   c.PostCount,
+			CreatedBy:   c.CreatedBy,
+			CreatorUsername: func() string {
+				if creator != nil {
+					return creator.Username
+				}
+				return ""
+			}(),
+			CreatedAt: c.CreatedAt,
+			UpdatedAt: c.UpdatedAt,
+			DeletedAt: c.DeletedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        communities,
+		"data":        communityResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -923,6 +1060,40 @@ func (h *CommunityHandler) AdminDeleteCommunity(w http.ResponseWriter, r *http.R
 		"success": true,
 		"message": "Community deleted successfully",
 	})
+}
+
+// AdminGetCommunityStats handles retrieving global community statistics.
+// @Summary Admin get community stats
+// @Description Retrieves global community statistics (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.CommunityGlobalStatsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/communities/stats [get]
+func (h *CommunityHandler) AdminGetCommunityStats(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	stats, err := h.communityService.AdminGetCommunityStats(r.Context(), days)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get community stats")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, stats)
 }
 
 // ======================================================================
