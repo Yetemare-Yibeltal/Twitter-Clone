@@ -39,7 +39,7 @@ func NewSettingsHandler(
 }
 
 // ======================================================================
-// Get Settings
+// Get All Settings
 // ======================================================================
 
 // GetSettings handles retrieving all user settings.
@@ -48,7 +48,7 @@ func NewSettingsHandler(
 // @Tags settings
 // @Security BearerAuth
 // @Produce json
-// @Success 200 {object} dto.SettingsResponse
+// @Success 200 {object} dto.AllSettingsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/settings [get]
@@ -59,7 +59,7 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	settings, err := h.settingsService.GetSettings(r.Context(), userID)
+	settings, err := h.settingsService.GetAllSettings(r.Context(), userID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get settings")
 		return
@@ -69,8 +69,34 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Update Profile Settings
+// Profile Settings
 // ======================================================================
+
+// GetProfileSettings handles retrieving profile settings.
+// @Summary Get profile settings
+// @Description Retrieves profile settings for the authenticated user
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.ProfileSettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/profile [get]
+func (h *SettingsHandler) GetProfileSettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetProfileSettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get profile settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
 
 // UpdateProfileSettings handles updating profile settings.
 // @Summary Update profile settings
@@ -114,10 +140,36 @@ func (h *SettingsHandler) UpdateProfileSettings(w http.ResponseWriter, r *http.R
 }
 
 // ======================================================================
-= Update Notification Settings
+// Notification Settings
 // ======================================================================
 
-// UpdateNotificationSettings handles updating notification preferences.
+// GetNotificationSettings handles retrieving notification settings.
+// @Summary Get notification settings
+// @Description Retrieves notification settings for the authenticated user
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.NotificationSettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/notifications [get]
+func (h *SettingsHandler) GetNotificationSettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetNotificationSettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get notification settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
+
+// UpdateNotificationSettings handles updating notification settings.
 // @Summary Update notification settings
 // @Description Updates the user's notification preferences
 // @Tags settings
@@ -158,8 +210,34 @@ func (h *SettingsHandler) UpdateNotificationSettings(w http.ResponseWriter, r *h
 }
 
 // ======================================================================
-= Update Privacy Settings
+// Privacy Settings
 // ======================================================================
+
+// GetPrivacySettings handles retrieving privacy settings.
+// @Summary Get privacy settings
+// @Description Retrieves privacy settings for the authenticated user
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.PrivacySettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/privacy [get]
+func (h *SettingsHandler) GetPrivacySettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetPrivacySettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get privacy settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
 
 // UpdatePrivacySettings handles updating privacy settings.
 // @Summary Update privacy settings
@@ -202,8 +280,34 @@ func (h *SettingsHandler) UpdatePrivacySettings(w http.ResponseWriter, r *http.R
 }
 
 // ======================================================================
-= Update Appearance Settings
+// Appearance Settings
 // ======================================================================
+
+// GetAppearanceSettings handles retrieving appearance settings.
+// @Summary Get appearance settings
+// @Description Retrieves appearance/theme settings for the authenticated user
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.AppearanceSettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/appearance [get]
+func (h *SettingsHandler) GetAppearanceSettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetAppearanceSettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get appearance settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
 
 // UpdateAppearanceSettings handles updating appearance settings.
 // @Summary Update appearance settings
@@ -246,8 +350,34 @@ func (h *SettingsHandler) UpdateAppearanceSettings(w http.ResponseWriter, r *htt
 }
 
 // ======================================================================
-= Update Language Settings
+// Language Settings
 // ======================================================================
+
+// GetLanguageSettings handles retrieving language settings.
+// @Summary Get language settings
+// @Description Retrieves language preferences for the authenticated user
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.LanguageSettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/language [get]
+func (h *SettingsHandler) GetLanguageSettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetLanguageSettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get language settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
 
 // UpdateLanguageSettings handles updating language settings.
 // @Summary Update language settings
@@ -283,126 +413,6 @@ func (h *SettingsHandler) UpdateLanguageSettings(w http.ResponseWriter, r *http.
 	settings, err := h.settingsService.UpdateLanguageSettings(r.Context(), userID, &req)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to update language settings")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, settings)
-}
-
-// ======================================================================
-= Get Privacy Settings
-// ======================================================================
-
-// GetPrivacySettings handles retrieving privacy settings.
-// @Summary Get privacy settings
-// @Description Retrieves the user's privacy settings
-// @Tags settings
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.PrivacySettingsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/settings/privacy [get]
-func (h *SettingsHandler) GetPrivacySettings(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	settings, err := h.settingsService.GetPrivacySettings(r.Context(), userID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get privacy settings")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, settings)
-}
-
-// ======================================================================
-= Get Notification Settings
-// ======================================================================
-
-// GetNotificationSettings handles retrieving notification settings.
-// @Summary Get notification settings
-// @Description Retrieves the user's notification settings
-// @Tags settings
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.NotificationSettingsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/settings/notifications [get]
-func (h *SettingsHandler) GetNotificationSettings(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	settings, err := h.settingsService.GetNotificationSettings(r.Context(), userID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get notification settings")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, settings)
-}
-
-// ======================================================================
-= Get Appearance Settings
-// ======================================================================
-
-// GetAppearanceSettings handles retrieving appearance settings.
-// @Summary Get appearance settings
-// @Description Retrieves the user's appearance/theme settings
-// @Tags settings
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.AppearanceSettingsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/settings/appearance [get]
-func (h *SettingsHandler) GetAppearanceSettings(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	settings, err := h.settingsService.GetAppearanceSettings(r.Context(), userID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get appearance settings")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, settings)
-}
-
-// ======================================================================
-= Get Language Settings
-// ======================================================================
-
-// GetLanguageSettings handles retrieving language settings.
-// @Summary Get language settings
-// @Description Retrieves the user's language preferences
-// @Tags settings
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.LanguageSettingsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/settings/language [get]
-func (h *SettingsHandler) GetLanguageSettings(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	settings, err := h.settingsService.GetLanguageSettings(r.Context(), userID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get language settings")
 		return
 	}
 
@@ -484,6 +494,17 @@ func (h *SettingsHandler) DeactivateAccount(w http.ResponseWriter, r *http.Reque
 
 	if err := req.Validate(); err != nil {
 		h.sendValidationError(w, err)
+		return
+	}
+
+	// Verify password
+	user, err := h.userService.GetUserByID(r.Context(), userID)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
+		return
+	}
+	if !user.CheckPassword(req.Password) {
+		h.sendError(w, http.StatusUnauthorized, "Incorrect password", nil)
 		return
 	}
 
@@ -579,7 +600,7 @@ func (h *SettingsHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) 
 }
 
 // ======================================================================
-= Export Data
+= Data Export
 // ======================================================================
 
 // ExportData handles exporting the user's data.
@@ -635,7 +656,26 @@ func (h *SettingsHandler) GetSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, sessions)
+	// Mark current session
+	currentToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	sessionResponses := make([]*dto.SessionResponse, 0, len(sessions))
+	for _, s := range sessions {
+		isCurrent := s.RefreshToken == currentToken
+		sessionResponses = append(sessionResponses, &dto.SessionResponse{
+			ID:        s.ID,
+			UserID:    s.UserID,
+			UserAgent: s.UserAgent,
+			IP:        s.IP,
+			CreatedAt: s.CreatedAt,
+			ExpiresAt: s.ExpiresAt,
+			IsCurrent: isCurrent,
+		})
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"sessions": sessionResponses,
+		"count":    len(sessionResponses),
+	})
 }
 
 // RevokeSession handles revoking a specific session.
@@ -669,9 +709,13 @@ func (h *SettingsHandler) RevokeSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get updated session count
+	sessions, _ := h.settingsService.GetSessions(r.Context(), userID)
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Session revoked successfully",
+		"success":      true,
+		"message":      "Session revoked successfully",
+		"session_count": len(sessions),
 	})
 }
 
@@ -700,6 +744,76 @@ func (h *SettingsHandler) RevokeAllSessions(w http.ResponseWriter, r *http.Reque
 		"success": true,
 		"message": "All sessions revoked successfully",
 	})
+}
+
+// ======================================================================
+= Account Recovery Settings
+// ======================================================================
+
+// GetRecoverySettings handles retrieving account recovery settings.
+// @Summary Get recovery settings
+// @Description Retrieves account recovery settings (email, phone, backup codes)
+// @Tags settings
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} dto.RecoverySettingsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/recovery [get]
+func (h *SettingsHandler) GetRecoverySettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	settings, err := h.settingsService.GetRecoverySettings(r.Context(), userID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get recovery settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
+}
+
+// UpdateRecoverySettings handles updating account recovery settings.
+// @Summary Update recovery settings
+// @Description Updates account recovery settings (email, phone)
+// @Tags settings
+// @Security BearerAuth
+// @Accept json
+// @Produce json
+// @Param request body dto.UpdateRecoverySettingsRequest true "Recovery settings"
+// @Success 200 {object} dto.RecoverySettingsResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/settings/recovery [put]
+func (h *SettingsHandler) UpdateRecoverySettings(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	var req dto.UpdateRecoverySettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, http.StatusBadRequest, "Invalid request body", nil)
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		h.sendValidationError(w, err)
+		return
+	}
+
+	settings, err := h.settingsService.UpdateRecoverySettings(r.Context(), userID, &req)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to update recovery settings")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, settings)
 }
 
 // ======================================================================
@@ -764,6 +878,16 @@ func (h *SettingsHandler) handleServiceError(w http.ResponseWriter, err error, d
 		h.sendError(w, http.StatusBadRequest, "Invalid language selection", nil)
 	case errors.Is(err, service.ErrInvalidTimezone):
 		h.sendError(w, http.StatusBadRequest, "Invalid timezone", nil)
+	case errors.Is(err, service.ErrInvalidRecoveryEmail):
+		h.sendError(w, http.StatusBadRequest, "Invalid recovery email", nil)
+	case errors.Is(err, service.ErrInvalidRecoveryPhone):
+		h.sendError(w, http.StatusBadRequest, "Invalid recovery phone number", nil)
+	case errors.Is(err, service.ErrUserNotFound):
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
+	case errors.Is(err, service.ErrUserSuspended):
+		h.sendError(w, http.StatusForbidden, "User is suspended", nil)
+	case errors.Is(err, service.ErrUserInactive):
+		h.sendError(w, http.StatusForbidden, "User is inactive", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
