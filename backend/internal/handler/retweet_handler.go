@@ -42,53 +42,10 @@ func NewRetweetHandler(
 }
 
 // ======================================================================
-// Toggle Retweet
+// Retweet/Unretweet
 // ======================================================================
 
-// ToggleRetweet handles retweeting/unretweeting a tweet.
-// @Summary Toggle retweet on tweet
-// @Description Retweets or unretweets a tweet (toggles)
-// @Tags retweets
-// @Security BearerAuth
-// @Param id path string true "Tweet ID"
-// @Success 200 {object} dto.RetweetResponse
-// @Failure 400 {object} dto.ErrorResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 404 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/retweets/{id}/toggle [post]
-func (h *RetweetHandler) ToggleRetweet(w http.ResponseWriter, r *http.Request) {
-	userID, err := middleware.GetUserID(r.Context())
-	if err != nil {
-		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	vars := mux.Vars(r)
-	tweetID := vars["id"]
-	if tweetID == "" {
-		h.sendError(w, http.StatusBadRequest, "Tweet ID required", nil)
-		return
-	}
-
-	result, err := h.retweetService.ToggleRetweet(r.Context(), userID, tweetID)
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to toggle retweet")
-		return
-	}
-
-	// Get updated retweet count
-	count, _ := h.retweetService.GetRetweetCount(r.Context(), tweetID)
-
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"retweeted":     result.Retweeted,
-		"retweet_count": count,
-		"tweet_id":      tweetID,
-		"timestamp":     time.Now().Unix(),
-	})
-}
-
-// RetweetTweet handles explicitly retweeting a tweet.
+// RetweetTweet handles retweeting a tweet.
 // @Summary Retweet a tweet
 // @Description Retweets a tweet
 // @Tags retweets
@@ -125,20 +82,16 @@ func (h *RetweetHandler) RetweetTweet(w http.ResponseWriter, r *http.Request) {
 	// Get updated retweet count
 	count, _ := h.retweetService.GetRetweetCount(r.Context(), tweetID)
 
-	// Create notification for tweet owner
-	tweet, err := h.tweetService.GetTweetByID(r.Context(), tweetID)
-	if err == nil && tweet.UserID != userID {
-		// Notification handled by service
-	}
-
 	h.sendSuccess(w, http.StatusCreated, map[string]interface{}{
 		"retweeted":     result.Retweeted,
+		"retweet_id":    result.ID,
 		"retweet_count": count,
 		"tweet_id":      tweetID,
+		"timestamp":     time.Now().Unix(),
 	})
 }
 
-// UnretweetTweet handles explicitly unretweeting a tweet.
+// UnretweetTweet handles unretweeting a tweet.
 // @Summary Unretweet a tweet
 // @Description Unretweets a tweet
 // @Tags retweets
@@ -175,8 +128,68 @@ func (h *RetweetHandler) UnretweetTweet(w http.ResponseWriter, r *http.Request) 
 
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
 		"retweeted":     result.Retweeted,
+		"retweet_id":    result.ID,
 		"retweet_count": count,
 		"tweet_id":      tweetID,
+		"timestamp":     time.Now().Unix(),
+	})
+}
+
+// ToggleRetweet handles toggling retweet status on a tweet.
+// @Summary Toggle retweet
+// @Description Toggles retweet status on a tweet
+// @Tags retweets
+// @Security BearerAuth
+// @Param id path string true "Tweet ID"
+// @Success 200 {object} dto.RetweetResponse
+// @Failure 400 {object} dto.ErrorResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 404 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/retweets/{id}/toggle [post]
+func (h *RetweetHandler) ToggleRetweet(w http.ResponseWriter, r *http.Request) {
+	userID, err := middleware.GetUserID(r.Context())
+	if err != nil {
+		h.sendError(w, http.StatusUnauthorized, "Unauthorized", nil)
+		return
+	}
+
+	vars := mux.Vars(r)
+	tweetID := vars["id"]
+	if tweetID == "" {
+		h.sendError(w, http.StatusBadRequest, "Tweet ID required", nil)
+		return
+	}
+
+	// Check if already retweeted
+	isRetweeted, err := h.retweetService.IsRetweeted(r.Context(), userID, tweetID)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to check retweet status")
+		return
+	}
+
+	var result *dto.RetweetResponse
+	if isRetweeted {
+		result, err = h.retweetService.UnretweetTweet(r.Context(), userID, tweetID)
+	} else {
+		result, err = h.retweetService.RetweetTweet(r.Context(), userID, tweetID)
+	}
+
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to toggle retweet")
+		return
+	}
+
+	// Get updated retweet count
+	count, _ := h.retweetService.GetRetweetCount(r.Context(), tweetID)
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"retweeted":     result.Retweeted,
+		"retweet_id":    result.ID,
+		"retweet_count": count,
+		"tweet_id":      tweetID,
+		"timestamp":     time.Now().Unix(),
 	})
 }
 
@@ -248,6 +261,13 @@ func (h *RetweetHandler) GetRetweetCount(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Verify tweet exists
+	_, err := h.tweetService.GetTweetByID(r.Context(), tweetID)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "Tweet not found", nil)
+		return
+	}
+
 	count, err := h.retweetService.GetRetweetCount(r.Context(), tweetID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get retweet count")
@@ -260,7 +280,11 @@ func (h *RetweetHandler) GetRetweetCount(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// GetRetweetsForTweets handles retrieving retweet counts for multiple tweets (bulk).
+// ======================================================================
+= Get Retweets for Tweets (Bulk)
+// ======================================================================
+
+// GetRetweetsForTweets handles retrieving retweet counts for multiple tweets.
 // @Summary Get retweet counts for multiple tweets
 // @Description Retrieves retweet counts for a list of tweet IDs
 // @Tags retweets
@@ -343,7 +367,7 @@ func (h *RetweetHandler) GetRetweeters(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Retweeted Tweets (User's retweets)
+= Get Retweeted Tweets
 // ======================================================================
 
 // GetRetweetedTweets handles retrieving tweets retweeted by the authenticated user.
@@ -386,6 +410,10 @@ func (h *RetweetHandler) GetRetweetedTweets(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// ======================================================================
+= Get Retweeted Tweet IDs
+// ======================================================================
+
 // GetRetweetedTweetIDs handles retrieving only the IDs of tweets retweeted by the user.
 // @Summary Get retweeted tweet IDs
 // @Description Retrieves only the IDs of tweets retweeted by the user
@@ -416,7 +444,7 @@ func (h *RetweetHandler) GetRetweetedTweetIDs(w http.ResponseWriter, r *http.Req
 }
 
 // ======================================================================
-= Get Retweet Status for Multiple Tweets (Bulk)
+= Get Retweet Statuses (Bulk)
 // ======================================================================
 
 // GetRetweetStatuses handles retrieving retweet statuses for multiple tweets.
@@ -462,7 +490,7 @@ func (h *RetweetHandler) GetRetweetStatuses(w http.ResponseWriter, r *http.Reque
 }
 
 // ======================================================================
-= Get Retweet Stats (User)
+= Get User Retweet Stats
 // ======================================================================
 
 // GetUserRetweetStats handles retrieving retweet statistics for the user.
@@ -492,7 +520,7 @@ func (h *RetweetHandler) GetUserRetweetStats(w http.ResponseWriter, r *http.Requ
 }
 
 // ======================================================================
-= Get Most Retweeted Tweets (Trending)
+= Get Most Retweeted Tweets
 // ======================================================================
 
 // GetMostRetweetedTweets handles retrieving the most retweeted tweets.
@@ -614,8 +642,33 @@ func (h *RetweetHandler) AdminListRetweets(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Build response
+	retweetResponses := make([]*dto.RetweetAdminResponse, 0, len(retweets))
+	for _, r := range retweets {
+		user, _ := h.userService.GetUserByID(r.Context(), r.UserID)
+		tweet, _ := h.tweetService.GetTweetByID(r.Context(), r.TweetID)
+		retweetResponses = append(retweetResponses, &dto.RetweetAdminResponse{
+			ID:           r.ID,
+			UserID:       r.UserID,
+			TweetID:      r.TweetID,
+			Username: func() string {
+				if user != nil {
+					return user.Username
+				}
+				return ""
+			}(),
+			TweetContent: func() string {
+				if tweet != nil {
+					return tweet.Content
+				}
+				return ""
+			}(),
+			CreatedAt: r.CreatedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        retweets,
+		"data":        retweetResponses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -741,6 +794,8 @@ func (h *RetweetHandler) handleServiceError(w http.ResponseWriter, err error, de
 		h.sendError(w, http.StatusBadRequest, "Invalid retweet ID", nil)
 	case errors.Is(err, service.ErrRetweetDisabled):
 		h.sendError(w, http.StatusBadRequest, "Retweeting is disabled for this tweet", nil)
+	case errors.Is(err, service.ErrInvalidUserID):
+		h.sendError(w, http.StatusBadRequest, "Invalid user ID", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
