@@ -5,34 +5,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
-
-	"twitter-clone/backend/internal/domain/entities"
 )
 
 // ======================================================================
-// Constants
+// Validation Constants
 // ======================================================================
 
 const (
-	MaxDMContentLength = 5000
-	MinDMContentLength = 1
-	MaxDMMediaCount    = 10
-	MaxDMMessageLimit  = 100
-	MinDMMessageLimit  = 1
-	DefaultDMLimit     = 20
+	MaxDMMessageLength    = 5000
+	MinDMMessageLength    = 1
+	MaxDMMediaCount       = 10
+	MaxDMMessageLimit     = 100
+	MinDMMessageLimit     = 1
+	DefaultDMLimit        = 20
+	MaxDMConversationName = 100
 )
 
 // ======================================================================
-// Validation Errors
+// Common Validation Errors
 // ======================================================================
 
 var (
 	ErrDMContentRequired     = errors.New("message content is required")
-	ErrDMContentTooLong      = fmt.Errorf("message content exceeds maximum length of %d characters", MaxDMContentLength)
-	ErrDMContentTooShort     = fmt.Errorf("message content must be at least %d character", MinDMContentLength)
+	ErrDMContentTooLong      = fmt.Errorf("message content exceeds maximum length of %d characters", MaxDMMessageLength)
+	ErrDMContentTooShort     = fmt.Errorf("message content must be at least %d character", MinDMMessageLength)
 	ErrDMRecipientRequired   = errors.New("recipient ID is required")
 	ErrDMSenderRequired      = errors.New("sender ID is required")
 	ErrDMSelfMessage         = errors.New("cannot send a message to yourself")
@@ -43,48 +41,45 @@ var (
 	ErrDMConversationNotFound = errors.New("conversation not found")
 	ErrDMMessageNotFound     = errors.New("message not found")
 	ErrDMInvalidMessageID    = errors.New("invalid message ID")
+	ErrDMUserIDRequired      = errors.New("user ID is required")
+	ErrDMConversationIDRequired = errors.New("conversation ID is required")
+	ErrDMInvalidAction       = errors.New("invalid action")
 )
 
 // ======================================================================
-= Send Message Request
+// Request DTOs
 // ======================================================================
 
-// SendMessageRequest represents the request body for sending a message.
+// SendMessageRequest represents the request to send a direct message.
 type SendMessageRequest struct {
-	ReceiverID string   `json:"receiver_id" binding:"required"`
-	Content    string   `json:"content" binding:"required"`
-	MediaURLs  []string `json:"media_urls"`
-	ReplyToID  string   `json:"reply_to_id,omitempty"`
-	Forwarded  bool     `json:"forwarded,omitempty"`
-	// Metadata for additional context (e.g., custom data)
-	Metadata map[string]string `json:"metadata,omitempty"`
+	ReceiverID string            `json:"receiver_id" binding:"required"`
+	Content    string            `json:"content" binding:"required"`
+	MediaURLs  []string          `json:"media_urls"`
+	ReplyToID  string            `json:"reply_to_id,omitempty"`
+	Forwarded  bool              `json:"forwarded,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
-// Validate performs comprehensive validation.
+// Validate validates the send message request.
 func (r *SendMessageRequest) Validate() error {
-	// Validate recipient
 	receiverTrimmed := strings.TrimSpace(r.ReceiverID)
 	if receiverTrimmed == "" {
 		return ErrDMRecipientRequired
 	}
 	r.ReceiverID = receiverTrimmed
-
-	// Validate content
 	contentTrimmed := strings.TrimSpace(r.Content)
 	if contentTrimmed == "" && len(r.MediaURLs) == 0 {
 		return ErrDMContentRequired
 	}
 	if contentTrimmed != "" {
-		if len(contentTrimmed) < MinDMContentLength {
+		if len(contentTrimmed) < MinDMMessageLength {
 			return ErrDMContentTooShort
 		}
-		if len(contentTrimmed) > MaxDMContentLength {
+		if len(contentTrimmed) > MaxDMMessageLength {
 			return ErrDMContentTooLong
 		}
 		r.Content = contentTrimmed
 	}
-
-	// Validate media URLs
 	if len(r.MediaURLs) > MaxDMMediaCount {
 		return ErrDMMediaTooMany
 	}
@@ -98,7 +93,6 @@ func (r *SendMessageRequest) Validate() error {
 		}
 		r.MediaURLs[i] = url
 	}
-	// Remove empty URLs
 	cleaned := make([]string, 0, len(r.MediaURLs))
 	for _, url := range r.MediaURLs {
 		if url != "" {
@@ -106,21 +100,17 @@ func (r *SendMessageRequest) Validate() error {
 		}
 	}
 	r.MediaURLs = cleaned
-
-	// Validate reply_to_id (optional)
 	if r.ReplyToID != "" {
 		r.ReplyToID = strings.TrimSpace(r.ReplyToID)
 	}
-
 	return nil
 }
 
-// Sanitize cleans up the request fields.
+// Sanitize sanitizes the send message request.
 func (r *SendMessageRequest) Sanitize() {
 	r.ReceiverID = strings.TrimSpace(r.ReceiverID)
 	r.Content = strings.TrimSpace(r.Content)
 	r.ReplyToID = strings.TrimSpace(r.ReplyToID)
-	// Clean media URLs
 	cleaned := make([]string, 0, len(r.MediaURLs))
 	for _, url := range r.MediaURLs {
 		url = strings.TrimSpace(url)
@@ -129,11 +119,10 @@ func (r *SendMessageRequest) Sanitize() {
 		}
 	}
 	r.MediaURLs = cleaned
+	if r.Metadata == nil {
+		r.Metadata = make(map[string]string)
+	}
 }
-
-// ======================================================================
-= Get Conversation Request
-// ======================================================================
 
 // GetConversationRequest represents the request for getting messages.
 type GetConversationRequest struct {
@@ -142,7 +131,7 @@ type GetConversationRequest struct {
 	Limit       int    `json:"limit"`
 }
 
-// Validate performs validation.
+// Validate validates the get conversation request.
 func (r *GetConversationRequest) Validate() error {
 	if strings.TrimSpace(r.OtherUserID) == "" {
 		return ErrDMRecipientRequired
@@ -173,9 +162,17 @@ func (r *GetConversationRequest) isValidCursor() bool {
 	return err == nil && parts[1] != ""
 }
 
-// ======================================================================
-= Mark Read Request
-// ======================================================================
+// Sanitize sanitizes the get conversation request.
+func (r *GetConversationRequest) Sanitize() {
+	r.OtherUserID = strings.TrimSpace(r.OtherUserID)
+	r.Cursor = strings.TrimSpace(r.Cursor)
+	if r.Limit < 1 {
+		r.Limit = DefaultDMLimit
+	}
+	if r.Limit > MaxDMMessageLimit {
+		r.Limit = MaxDMMessageLimit
+	}
+}
 
 // MarkReadRequest represents the request for marking messages as read.
 type MarkReadRequest struct {
@@ -183,7 +180,7 @@ type MarkReadRequest struct {
 	Conversation string   `json:"conversation,omitempty"` // other user ID
 }
 
-// Validate performs validation.
+// Validate validates the mark read request.
 func (r *MarkReadRequest) Validate() error {
 	if len(r.MessageIDs) == 0 && r.Conversation == "" {
 		return errors.New("either message_ids or conversation is required")
@@ -199,9 +196,17 @@ func (r *MarkReadRequest) Validate() error {
 	return nil
 }
 
-// ======================================================================
-= Delete Message Request
-// ======================================================================
+// Sanitize sanitizes the mark read request.
+func (r *MarkReadRequest) Sanitize() {
+	cleaned := make([]string, 0, len(r.MessageIDs))
+	for _, id := range r.MessageIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	r.MessageIDs = cleaned
+	r.Conversation = strings.TrimSpace(r.Conversation)
+}
 
 // DeleteMessageRequest represents the request for deleting messages.
 type DeleteMessageRequest struct {
@@ -209,7 +214,7 @@ type DeleteMessageRequest struct {
 	DeleteForAll bool     `json:"delete_for_all"`
 }
 
-// Validate performs validation.
+// Validate validates the delete message request.
 func (r *DeleteMessageRequest) Validate() error {
 	if len(r.MessageIDs) == 0 {
 		return errors.New("message_ids is required")
@@ -222,26 +227,32 @@ func (r *DeleteMessageRequest) Validate() error {
 	return nil
 }
 
-// ======================================================================
-= Search Messages Request
-// ======================================================================
+// Sanitize sanitizes the delete message request.
+func (r *DeleteMessageRequest) Sanitize() {
+	cleaned := make([]string, 0, len(r.MessageIDs))
+	for _, id := range r.MessageIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	r.MessageIDs = cleaned
+}
 
 // SearchMessagesRequest represents the request for searching messages.
 type SearchMessagesRequest struct {
-	Query   string `json:"query" binding:"required"`
-	With    string `json:"with,omitempty"` // filter by user ID
-	Cursor  string `json:"cursor"`
-	Limit   int    `json:"limit"`
+	Query  string `json:"query" binding:"required"`
+	With   string `json:"with,omitempty"` // filter by user ID
+	Cursor string `json:"cursor"`
+	Limit  int    `json:"limit"`
 }
 
-// Validate performs validation.
+// Validate validates the search messages request.
 func (r *SearchMessagesRequest) Validate() error {
 	queryTrimmed := strings.TrimSpace(r.Query)
 	if queryTrimmed == "" {
 		return errors.New("search query is required")
 	}
 	r.Query = queryTrimmed
-
 	if r.Limit < 1 || r.Limit > MaxDMMessageLimit {
 		if r.Limit == 0 {
 			r.Limit = DefaultDMLimit
@@ -258,21 +269,33 @@ func (r *SearchMessagesRequest) Validate() error {
 	return nil
 }
 
+// Sanitize sanitizes the search messages request.
+func (r *SearchMessagesRequest) Sanitize() {
+	r.Query = strings.TrimSpace(r.Query)
+	r.With = strings.TrimSpace(r.With)
+	r.Cursor = strings.TrimSpace(r.Cursor)
+	if r.Limit < 1 {
+		r.Limit = DefaultDMLimit
+	}
+	if r.Limit > MaxDMMessageLimit {
+		r.Limit = MaxDMMessageLimit
+	}
+}
+
 // ======================================================================
-= Helper Functions
+// Helper Function
 // ======================================================================
 
-// isValidDMURL validates URL format.
+// isValidDMURL validates URL format for DM media.
 func isValidDMURL(url string) bool {
 	if len(url) > 2048 {
 		return false
 	}
-	re := regexp.MustCompile(`^(https?://|/)[^\s]+$`)
-	return re.MatchString(url)
+	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
 }
 
 // ======================================================================
-= DM Response DTOs
+// Response DTOs
 // ======================================================================
 
 // MessageResponse represents a single message in responses.
@@ -317,247 +340,413 @@ type MessageListResponse struct {
 	TotalCount int64              `json:"total_count"`
 }
 
+// UnreadCountResponse represents unread count response.
+type UnreadCountResponse struct {
+	UserID   string `json:"user_id"`
+	Unread   int64  `json:"unread"`
+	Total    int64  `json:"total"`
+}
+
+// DMStatsResponse represents direct message statistics.
+type DMStatsResponse struct {
+	TotalMessages   int64     `json:"total_messages"`
+	TotalSent       int64     `json:"total_sent"`
+	TotalReceived   int64     `json:"total_received"`
+	UnreadCount     int64     `json:"unread_count"`
+	Conversations   int64     `json:"conversations"`
+	LastMessageAt   time.Time `json:"last_message_at"`
+	FirstMessageAt  time.Time `json:"first_message_at"`
+}
+
 // ======================================================================
-= Builder Functions for Responses
+// Builder Methods for MessageResponse
 // ======================================================================
 
-// ToMessageResponse converts a message entity to a response DTO.
-func ToMessageResponse(msg *entities.Message) *MessageResponse {
+// NewMessageResponse creates a new message response.
+func NewMessageResponse() *MessageResponse {
 	return &MessageResponse{
-		ID:         msg.ID,
-		SenderID:   msg.SenderID,
-		ReceiverID: msg.ReceiverID,
-		Content:    msg.Content,
-		MediaURLs:  msg.MediaURLs,
-		Read:       msg.Read,
-		ReadAt:     msg.ReadAt,
-		ReplyToID:  msg.Metadata.ReplyToID,
-		Forwarded:  msg.Metadata.ForwardedFrom != "",
-		IsEdited:   msg.Metadata.IsEdited,
-		EditedAt:   msg.Metadata.EditedAt,
-		CustomData: msg.Metadata.CustomData,
-		CreatedAt:  msg.CreatedAt,
-		UpdatedAt:  msg.UpdatedAt,
-	}
-}
-
-// ToMessageResponses converts multiple message entities to response DTOs.
-func ToMessageResponses(messages []*entities.Message) []*MessageResponse {
-	responses := make([]*MessageResponse, 0, len(messages))
-	for _, msg := range messages {
-		responses = append(responses, ToMessageResponse(msg))
-	}
-	return responses
-}
-
-// ToConversationResponse converts a conversation to a response DTO.
-func ToConversationResponse(conv *entities.Conversation) *ConversationResponse {
-	// Note: entities.Conversation may not exist; using the interface type
-	return &ConversationResponse{
-		OtherUserID:         conv.OtherUserID,
-		LastMessageID:       conv.LastMessageID,
-		LastMessageContent:  conv.LastMessageContent,
-		LastMessageAt:       conv.LastMessageAt,
-		LastMessageRead:     conv.LastMessageRead,
-		UnreadCount:         conv.UnreadCount,
-	}
-}
-
-// ======================================================================
-= Builder Methods for Testing
-// ======================================================================
-
-// NewSendMessageRequest creates a new request with defaults.
-func NewSendMessageRequest() *SendMessageRequest {
-	return &SendMessageRequest{
-		ReceiverID: "user123",
-		Content:    "Hello, this is a test message!",
 		MediaURLs:  []string{},
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
 }
 
-// WithReceiver sets the receiver ID.
-func (r *SendMessageRequest) WithReceiver(receiverID string) *SendMessageRequest {
+// WithID sets the message ID.
+func (r *MessageResponse) WithID(id string) *MessageResponse {
+	r.ID = id
+	return r
+}
+
+// WithSenderID sets the sender ID.
+func (r *MessageResponse) WithSenderID(senderID string) *MessageResponse {
+	r.SenderID = senderID
+	return r
+}
+
+// WithReceiverID sets the receiver ID.
+func (r *MessageResponse) WithReceiverID(receiverID string) *MessageResponse {
 	r.ReceiverID = receiverID
 	return r
 }
 
 // WithContent sets the content.
-func (r *SendMessageRequest) WithContent(content string) *SendMessageRequest {
+func (r *MessageResponse) WithContent(content string) *MessageResponse {
 	r.Content = content
 	return r
 }
 
-// WithMedia adds media URLs.
-func (r *SendMessageRequest) WithMedia(urls ...string) *SendMessageRequest {
+// WithMediaURLs sets the media URLs.
+func (r *MessageResponse) WithMediaURLs(urls ...string) *MessageResponse {
 	r.MediaURLs = append(r.MediaURLs, urls...)
 	return r
 }
 
-// WithReplyTo sets the reply-to ID.
-func (r *SendMessageRequest) WithReplyTo(replyToID string) *SendMessageRequest {
-	r.ReplyToID = replyToID
+// WithRead sets the read status.
+func (r *MessageResponse) WithRead(read bool) *MessageResponse {
+	r.Read = read
 	return r
 }
 
-// NewGetConversationRequest creates a new request.
-func NewGetConversationRequest() *GetConversationRequest {
-	return &GetConversationRequest{
-		OtherUserID: "user123",
-		Limit:       DefaultDMLimit,
-	}
-}
-
-// NewMarkReadRequest creates a new mark read request.
-func NewMarkReadRequest() *MarkReadRequest {
-	return &MarkReadRequest{
-		MessageIDs: []string{},
-	}
-}
-
-// WithMessageIDs sets message IDs.
-func (r *MarkReadRequest) WithMessageIDs(ids ...string) *MarkReadRequest {
-	r.MessageIDs = append(r.MessageIDs, ids...)
+// WithReadAt sets the read at time.
+func (r *MessageResponse) WithReadAt(t time.Time) *MessageResponse {
+	r.ReadAt = &t
 	return r
 }
 
-// WithConversation sets the conversation identifier.
-func (r *MarkReadRequest) WithConversation(otherUserID string) *MarkReadRequest {
-	r.Conversation = otherUserID
+// WithReplyToID sets the reply-to ID.
+func (r *MessageResponse) WithReplyToID(id string) *MessageResponse {
+	r.ReplyToID = id
 	return r
 }
 
-// NewDeleteMessageRequest creates a new delete request.
-func NewDeleteMessageRequest() *DeleteMessageRequest {
-	return &DeleteMessageRequest{
-		MessageIDs:   []string{},
-		DeleteForAll: false,
-	}
-}
-
-// WithMessageIDs sets message IDs.
-func (r *DeleteMessageRequest) WithMessageIDs(ids ...string) *DeleteMessageRequest {
-	r.MessageIDs = append(r.MessageIDs, ids...)
+// WithForwarded sets the forwarded flag.
+func (r *MessageResponse) WithForwarded(forwarded bool) *MessageResponse {
+	r.Forwarded = forwarded
 	return r
 }
 
-// WithDeleteForAll sets delete for all.
-func (r *DeleteMessageRequest) WithDeleteForAll(deleteForAll bool) *DeleteMessageRequest {
-	r.DeleteForAll = deleteForAll
+// WithEdited sets the edited flag.
+func (r *MessageResponse) WithEdited(edited bool) *MessageResponse {
+	r.IsEdited = edited
 	return r
 }
 
-// NewSearchMessagesRequest creates a new search request.
-func NewSearchMessagesRequest() *SearchMessagesRequest {
-	return &SearchMessagesRequest{
-		Query: "test",
-		Limit: DefaultDMLimit,
-	}
-}
-
-// WithQuery sets the search query.
-func (r *SearchMessagesRequest) WithQuery(query string) *SearchMessagesRequest {
-	r.Query = query
+// WithEditedAt sets the edited at time.
+func (r *MessageResponse) WithEditedAt(t time.Time) *MessageResponse {
+	r.EditedAt = &t
 	return r
 }
 
-// WithUser filters by user.
-func (r *SearchMessagesRequest) WithUser(userID string) *SearchMessagesRequest {
-	r.With = userID
+// WithCustomData sets the custom data.
+func (r *MessageResponse) WithCustomData(data map[string]string) *MessageResponse {
+	r.CustomData = data
+	return r
+}
+
+// WithCreatedAt sets the creation time.
+func (r *MessageResponse) WithCreatedAt(t time.Time) *MessageResponse {
+	r.CreatedAt = t
+	return r
+}
+
+// WithUpdatedAt sets the update time.
+func (r *MessageResponse) WithUpdatedAt(t time.Time) *MessageResponse {
+	r.UpdatedAt = t
 	return r
 }
 
 // ======================================================================
-= Error Response Helpers
+// Builder Methods for ConversationResponse
 // ======================================================================
 
-// DMError represents a direct message error.
-type DMError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Details interface{} `json:"details,omitempty"`
+// NewConversationResponse creates a new conversation response.
+func NewConversationResponse() *ConversationResponse {
+	return &ConversationResponse{}
 }
 
-// Error implements the error interface.
-func (e DMError) Error() string {
-	return e.Message
+// WithOtherUserID sets the other user ID.
+func (r *ConversationResponse) WithOtherUserID(id string) *ConversationResponse {
+	r.OtherUserID = id
+	return r
 }
 
-// NewDMError creates a new DM error.
-func NewDMError(code, message string, details interface{}) *DMError {
-	return &DMError{
-		Code:    code,
-		Message: message,
-		Details: details,
+// WithLastMessageID sets the last message ID.
+func (r *ConversationResponse) WithLastMessageID(id string) *ConversationResponse {
+	r.LastMessageID = id
+	return r
+}
+
+// WithLastMessageContent sets the last message content.
+func (r *ConversationResponse) WithLastMessageContent(content string) *ConversationResponse {
+	r.LastMessageContent = content
+	return r
+}
+
+// WithLastMessageAt sets the last message time.
+func (r *ConversationResponse) WithLastMessageAt(t time.Time) *ConversationResponse {
+	r.LastMessageAt = t
+	return r
+}
+
+// WithLastMessageRead sets the last message read status.
+func (r *ConversationResponse) WithLastMessageRead(read bool) *ConversationResponse {
+	r.LastMessageRead = read
+	return r
+}
+
+// WithUnreadCount sets the unread count.
+func (r *ConversationResponse) WithUnreadCount(count int) *ConversationResponse {
+	r.UnreadCount = count
+	return r
+}
+
+// ======================================================================
+// Builder Methods for ConversationListResponse
+// ======================================================================
+
+// NewConversationListResponse creates a new conversation list response.
+func NewConversationListResponse() *ConversationListResponse {
+	return &ConversationListResponse{
+		Conversations: []*ConversationResponse{},
 	}
 }
 
+// Add adds a conversation to the response.
+func (r *ConversationListResponse) Add(conv *ConversationResponse) {
+	r.Conversations = append(r.Conversations, conv)
+}
+
+// WithTotalCount sets the total count.
+func (r *ConversationListResponse) WithTotalCount(count int64) *ConversationListResponse {
+	r.TotalCount = count
+	return r
+}
+
 // ======================================================================
-= JSON Custom Marshaling
+// Builder Methods for MessageListResponse
 // ======================================================================
 
-// MarshalJSON implements custom JSON marshaling for SendMessageRequest.
-func (r SendMessageRequest) MarshalJSON() ([]byte, error) {
-	type Alias SendMessageRequest
+// NewMessageListResponse creates a new message list response.
+func NewMessageListResponse() *MessageListResponse {
+	return &MessageListResponse{
+		Messages: []*MessageResponse{},
+	}
+}
+
+// Add adds a message to the response.
+func (r *MessageListResponse) Add(msg *MessageResponse) {
+	r.Messages = append(r.Messages, msg)
+}
+
+// WithNextCursor sets the next cursor.
+func (r *MessageListResponse) WithNextCursor(cursor string) *MessageListResponse {
+	r.NextCursor = cursor
+	r.HasMore = cursor != ""
+	return r
+}
+
+// WithTotalCount sets the total count.
+func (r *MessageListResponse) WithTotalCount(count int64) *MessageListResponse {
+	r.TotalCount = count
+	return r
+}
+
+// ======================================================================
+// Builder Methods for DMStatsResponse
+// ======================================================================
+
+// NewDMStatsResponse creates a new DM stats response.
+func NewDMStatsResponse() *DMStatsResponse {
+	return &DMStatsResponse{}
+}
+
+// WithTotalMessages sets the total messages.
+func (r *DMStatsResponse) WithTotalMessages(total int64) *DMStatsResponse {
+	r.TotalMessages = total
+	return r
+}
+
+// WithTotalSent sets the total sent.
+func (r *DMStatsResponse) WithTotalSent(sent int64) *DMStatsResponse {
+	r.TotalSent = sent
+	return r
+}
+
+// WithTotalReceived sets the total received.
+func (r *DMStatsResponse) WithTotalReceived(received int64) *DMStatsResponse {
+	r.TotalReceived = received
+	return r
+}
+
+// WithUnreadCount sets the unread count.
+func (r *DMStatsResponse) WithUnreadCount(unread int64) *DMStatsResponse {
+	r.UnreadCount = unread
+	return r
+}
+
+// WithConversations sets the conversations count.
+func (r *DMStatsResponse) WithConversations(convs int64) *DMStatsResponse {
+	r.Conversations = convs
+	return r
+}
+
+// WithLastMessageAt sets the last message time.
+func (r *DMStatsResponse) WithLastMessageAt(t time.Time) *DMStatsResponse {
+	r.LastMessageAt = t
+	return r
+}
+
+// WithFirstMessageAt sets the first message time.
+func (r *DMStatsResponse) WithFirstMessageAt(t time.Time) *DMStatsResponse {
+	r.FirstMessageAt = t
+	return r
+}
+
+// ======================================================================
+// Conversion Helpers
+// ======================================================================
+
+// ToMessageResponse converts message data to a response.
+func ToMessageResponse(id, senderID, receiverID, content string, mediaURLs []string, read bool, readAt, editedAt *time.Time, replyToID string, forwarded, isEdited bool, customData map[string]string, createdAt, updatedAt time.Time) *MessageResponse {
+	resp := NewMessageResponse()
+	resp.WithID(id).
+		WithSenderID(senderID).
+		WithReceiverID(receiverID).
+		WithContent(content).
+		WithMediaURLs(mediaURLs...).
+		WithRead(read).
+		WithReplyToID(replyToID).
+		WithForwarded(forwarded).
+		WithEdited(isEdited).
+		WithCustomData(customData).
+		WithCreatedAt(createdAt).
+		WithUpdatedAt(updatedAt)
+	if readAt != nil {
+		resp.WithReadAt(*readAt)
+	}
+	if editedAt != nil {
+		resp.WithEditedAt(*editedAt)
+	}
+	return resp
+}
+
+// ToConversationResponse converts conversation data to a response.
+func ToConversationResponse(otherUserID, lastMessageID, lastMessageContent string, lastMessageAt time.Time, lastMessageRead bool, unreadCount int) *ConversationResponse {
+	resp := NewConversationResponse()
+	resp.WithOtherUserID(otherUserID).
+		WithLastMessageID(lastMessageID).
+		WithLastMessageContent(lastMessageContent).
+		WithLastMessageAt(lastMessageAt).
+		WithLastMessageRead(lastMessageRead).
+		WithUnreadCount(unreadCount)
+	return resp
+}
+
+// ======================================================================
+// JSON Serialization
+// ======================================================================
+
+// MarshalJSON implements custom JSON marshaling.
+func (r *MessageResponse) MarshalJSON() ([]byte, error) {
+	type Alias MessageResponse
 	return json.Marshal(&struct {
-		Alias
-		Content string `json:"content,omitempty"`
+		*Alias
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
 	}{
-		Alias:   (Alias)(r),
-		Content: r.Content,
+		Alias:     (*Alias)(r),
+		CreatedAt: r.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: r.UpdatedAt.Format(time.RFC3339),
 	})
 }
 
-// ======================================================================
-= Validation Error Helpers
-// ======================================================================
-
-// DMValidationError represents a field validation error.
-type DMValidationError struct {
-	Field   string `json:"field"`
-	Message string `json:"message"`
-}
-
-func (e DMValidationError) Error() string {
-	return fmt.Sprintf("%s: %s", e.Field, e.Message)
-}
-
-// DMValidationErrors is a collection of validation errors.
-type DMValidationErrors []DMValidationError
-
-func (ve DMValidationErrors) Error() string {
-	messages := make([]string, 0, len(ve))
-	for _, err := range ve {
-		messages = append(messages, err.Error())
+// UnmarshalJSON implements custom JSON unmarshaling.
+func (r *MessageResponse) UnmarshalJSON(data []byte) error {
+	type Alias MessageResponse
+	aux := &struct {
+		*Alias
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+	}{
+		Alias: (*Alias)(r),
 	}
-	return strings.Join(messages, "; ")
-}
-
-func (ve DMValidationErrors) ToMap() map[string]string {
-	result := make(map[string]string)
-	for _, err := range ve {
-		result[err.Field] = err.Message
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
 	}
-	return result
+	if aux.CreatedAt != "" {
+		t, err := time.Parse(time.RFC3339, aux.CreatedAt)
+		if err == nil {
+			r.CreatedAt = t
+		}
+	}
+	if aux.UpdatedAt != "" {
+		t, err := time.Parse(time.RFC3339, aux.UpdatedAt)
+		if err == nil {
+			r.UpdatedAt = t
+		}
+	}
+	return nil
 }
 
 // ======================================================================
-= Test Helpers
+// Test Helpers
 // ======================================================================
 
-var (
-	TestSendDMRequest = NewSendMessageRequest()
-	TestGetDMRequest  = NewGetConversationRequest()
-	TestMarkDMRead    = NewMarkReadRequest().WithMessageIDs("msg1", "msg2")
+// NewTestSendMessageRequest creates a test send message request.
+func NewTestSendMessageRequest() *SendMessageRequest {
+	return &SendMessageRequest{
+		ReceiverID: "user2",
+		Content:    "Hello there!",
+		MediaURLs:  []string{},
+	}
+}
+
+// NewTestGetConversationRequest creates a test get conversation request.
+func NewTestGetConversationRequest() *GetConversationRequest {
+	return &GetConversationRequest{
+		OtherUserID: "user2",
+		Limit:       20,
+	}
+}
+
+// NewTestMarkReadRequest creates a test mark read request.
+func NewTestMarkReadRequest() *MarkReadRequest {
+	return &MarkReadRequest{
+		MessageIDs: []string{"msg1", "msg2"},
+	}
+}
+
+// NewTestMessageResponse creates a test message response.
+func NewTestMessageResponse() *MessageResponse {
+	resp := NewMessageResponse().
+		WithID("msg1").
+		WithSenderID("user1").
+		WithReceiverID("user2").
+		WithContent("Hello there!").
+		WithRead(false).
+		WithForwarded(false).
+		WithEdited(false)
+	resp.WithCustomData(map[string]string{
+		"source": "web",
+	})
+	return resp
+}
+
+// NewTestConversationResponse creates a test conversation response.
+func NewTestConversationResponse() *ConversationResponse {
+	return NewConversationResponse().
+		WithOtherUserID("user2").
+		WithLastMessageID("msg1").
+		WithLastMessageContent("Hello there!").
+		WithLastMessageAt(time.Now().UTC()).
+		WithLastMessageRead(false).
+		WithUnreadCount(3)
+}
+
+// ======================================================================
+// API Documentation Constants
+// ======================================================================
+
+const (
+	APITagDM = "Direct Messages"
 )
-
-// MustCreateSendRequest creates a request or panics on error.
-func MustCreateSendRequest(receiverID, content string) *SendMessageRequest {
-	req := NewSendMessageRequest().
-		WithReceiver(receiverID).
-		WithContent(content)
-	if err := req.Validate(); err != nil {
-		panic(err)
-	}
-	return req
-}
