@@ -22,13 +22,21 @@ import (
 // SearchHandler handles all search-related HTTP endpoints.
 type SearchHandler struct {
 	searchService service.SearchService
+	tweetService  service.TweetService
+	userService   service.UserService
 	log           *logrus.Entry
 }
 
 // NewSearchHandler creates a new search handler.
-func NewSearchHandler(searchService service.SearchService) *SearchHandler {
+func NewSearchHandler(
+	searchService service.SearchService,
+	tweetService service.TweetService,
+	userService service.UserService,
+) *SearchHandler {
 	return &SearchHandler{
 		searchService: searchService,
+		tweetService:  tweetService,
+		userService:   userService,
 		log:           logger.WithField("handler", "search"),
 	}
 }
@@ -52,6 +60,7 @@ func NewSearchHandler(searchService service.SearchService) *SearchHandler {
 // @Param include_replies query bool false "Include replies in results"
 // @Param include_retweets query bool false "Include retweets in results"
 // @Param media_only query bool false "Only show tweets with media"
+// @Param sort_by query string false "Sort by (relevance, latest, oldest, most_liked, most_retweeted)"
 // @Success 200 {object} dto.TweetSearchResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -77,26 +86,37 @@ func (h *SearchHandler) SearchTweets(w http.ResponseWriter, r *http.Request) {
 		limit = 20
 	}
 
+	// Parse sort
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+
 	// Call service
-	tweets, nextCursor, total, err := h.searchService.SearchTweets(r.Context(), query, filters, cursor, limit)
+	tweets, nextCursor, total, err := h.searchService.SearchTweets(r.Context(), query, filters, cursor, limit, sortBy)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to search tweets")
 		return
 	}
 
 	// Mark interactions for current user if authenticated
-	if currentUserID != "" {
+	if currentUserID != "" && len(tweets) > 0 {
 		h.markTweetInteractions(r.Context(), tweets, currentUserID)
 	}
 
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        tweets,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
-		"query":       query,
-	})
+	// Build response
+	response := &dto.TweetSearchResponse{
+		Data:        tweets,
+		NextCursor:  nextCursor,
+		HasMore:     nextCursor != "",
+		Limit:       limit,
+		Total:       total,
+		Query:       query,
+		SortBy:      sortBy,
+		Filters:     filters,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // ======================================================================
@@ -112,6 +132,8 @@ func (h *SearchHandler) SearchTweets(w http.ResponseWriter, r *http.Request) {
 // @Param q query string true "Search query"
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param sort_by query string false "Sort by (relevance, followers, tweets, joined_at)"
+// @Param filter_following query bool false "Only show users the authenticated user follows"
 // @Success 200 {object} dto.UserSearchResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -129,23 +151,31 @@ func (h *SearchHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+	filterFollowing, _ := strconv.ParseBool(r.URL.Query().Get("filter_following"))
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	users, nextCursor, total, err := h.searchService.SearchUsers(r.Context(), query, cursor, limit, currentUserID)
+	users, nextCursor, total, err := h.searchService.SearchUsers(r.Context(), query, cursor, limit, sortBy, filterFollowing, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to search users")
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        users,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
-		"query":       query,
-	})
+	// Build response
+	response := &dto.UserSearchResponse{
+		Data:        users,
+		NextCursor:  nextCursor,
+		HasMore:     nextCursor != "",
+		Limit:       limit,
+		Total:       total,
+		Query:       query,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // ======================================================================
@@ -160,6 +190,7 @@ func (h *SearchHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 // @Param q query string true "Search query (without #)"
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
+// @Param sort_by query string false "Sort by (relevance, popularity, latest)"
 // @Success 200 {object} dto.HashtagSearchResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -176,25 +207,32 @@ func (h *SearchHandler) SearchHashtags(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 100 {
 		limit = 20
 	}
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "popularity"
+	}
 
-	hashtags, nextCursor, total, err := h.searchService.SearchHashtags(r.Context(), query, cursor, limit)
+	hashtags, nextCursor, total, err := h.searchService.SearchHashtags(r.Context(), query, cursor, limit, sortBy)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to search hashtags")
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        hashtags,
-		"next_cursor": nextCursor,
-		"has_more":    nextCursor != "",
-		"limit":       limit,
-		"total":       total,
-		"query":       query,
-	})
+	// Build response
+	response := &dto.HashtagSearchResponse{
+		Data:        hashtags,
+		NextCursor:  nextCursor,
+		HasMore:     nextCursor != "",
+		Limit:       limit,
+		Total:       total,
+		Query:       query,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // ======================================================================
-// Search All (Combined)
+= Search All (Combined)
 // ======================================================================
 
 // SearchAll handles combined search across tweets, users, and hashtags.
@@ -205,6 +243,9 @@ func (h *SearchHandler) SearchHashtags(w http.ResponseWriter, r *http.Request) {
 // @Produce json
 // @Param q query string true "Search query"
 // @Param limit query int false "Items per category (default 10, max 50)"
+// @Param include_tweets query bool false "Include tweets in results"
+// @Param include_users query bool false "Include users in results"
+// @Param include_hashtags query bool false "Include hashtags in results"
 // @Success 200 {object} dto.CombinedSearchResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 401 {object} dto.ErrorResponse
@@ -221,14 +262,27 @@ func (h *SearchHandler) SearchAll(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 50 {
 		limit = 10
 	}
+	includeTweets, _ := strconv.ParseBool(r.URL.Query().Get("include_tweets"))
+	includeUsers, _ := strconv.ParseBool(r.URL.Query().Get("include_users"))
+	includeHashtags, _ := strconv.ParseBool(r.URL.Query().Get("include_hashtags"))
+
+	// Default to include all if none specified
+	if !includeTweets && !includeUsers && !includeHashtags {
+		includeTweets = true
+		includeUsers = true
+		includeHashtags = true
+	}
 
 	currentUserID, _ := middleware.GetUserID(r.Context())
 
-	results, err := h.searchService.SearchAll(r.Context(), query, "", limit, currentUserID)
+	results, err := h.searchService.SearchAll(r.Context(), query, limit, includeTweets, includeUsers, includeHashtags, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to perform combined search")
 		return
 	}
+
+	// Add query to response
+	results.Query = query
 
 	h.sendSuccess(w, http.StatusOK, results)
 }
@@ -244,6 +298,9 @@ func (h *SearchHandler) SearchAll(w http.ResponseWriter, r *http.Request) {
 // @Produce json
 // @Param q query string true "Partial search query"
 // @Param limit query int false "Number of suggestions (default 10, max 20)"
+// @Param include_hashtags query bool false "Include hashtag suggestions"
+// @Param include_users query bool false "Include user suggestions"
+// @Param include_trending query bool false "Include trending suggestions"
 // @Success 200 {object} dto.SearchSuggestionsResponse
 // @Failure 400 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -259,8 +316,20 @@ func (h *SearchHandler) GetSuggestions(w http.ResponseWriter, r *http.Request) {
 	if err != nil || limit < 1 || limit > 20 {
 		limit = 10
 	}
+	includeHashtags, _ := strconv.ParseBool(r.URL.Query().Get("include_hashtags"))
+	includeUsers, _ := strconv.ParseBool(r.URL.Query().Get("include_users"))
+	includeTrending, _ := strconv.ParseBool(r.URL.Query().Get("include_trending"))
 
-	suggestions, err := h.searchService.GetSearchSuggestions(r.Context(), query, limit)
+	// Default to all types
+	if !includeHashtags && !includeUsers && !includeTrending {
+		includeHashtags = true
+		includeUsers = true
+		includeTrending = true
+	}
+
+	currentUserID, _ := middleware.GetUserID(r.Context())
+
+	suggestions, err := h.searchService.GetSearchSuggestions(r.Context(), query, limit, includeHashtags, includeUsers, includeTrending, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get suggestions")
 		return
@@ -279,6 +348,7 @@ func (h *SearchHandler) GetSuggestions(w http.ResponseWriter, r *http.Request) {
 // @Tags search
 // @Produce json
 // @Param limit query int false "Number of trending searches (default 10, max 50)"
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
 // @Success 200 {object} dto.TrendingSearchesResponse
 // @Failure 500 {object} dto.ErrorResponse
 // @Router /api/search/trending [get]
@@ -287,53 +357,30 @@ func (h *SearchHandler) GetTrendingSearches(w http.ResponseWriter, r *http.Reque
 	if err != nil || limit < 1 || limit > 50 {
 		limit = 10
 	}
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
 
-	trending, err := h.searchService.GetTrendingSearches(r.Context(), limit)
+	currentUserID, _ := middleware.GetUserID(r.Context())
+
+	trending, err := h.searchService.GetTrendingSearches(r.Context(), limit, days, currentUserID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get trending searches")
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"trending": trending,
-		"limit":    limit,
-	})
+	response := &dto.TrendingSearchesResponse{
+		Trending: trending,
+		Limit:    limit,
+		Days:     days,
+	}
+
+	h.sendSuccess(w, http.StatusOK, response)
 }
 
 // ======================================================================
-= Get Search Stats (Admin only)
-// ======================================================================
-
-// GetSearchStats handles retrieving search analytics.
-// @Summary Get search statistics
-// @Description Returns search usage analytics (admin only)
-// @Tags search
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.SearchStatsResponse
-// @Failure 401 {object} dto.ErrorResponse
-// @Failure 403 {object} dto.ErrorResponse
-// @Failure 500 {object} dto.ErrorResponse
-// @Router /api/admin/search/stats [get]
-func (h *SearchHandler) GetSearchStats(w http.ResponseWriter, r *http.Request) {
-	// Check admin role
-	role, err := middleware.GetUserRole(r.Context())
-	if err != nil || role != "admin" {
-		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
-		return
-	}
-
-	stats, err := h.searchService.GetSearchStats(r.Context())
-	if err != nil {
-		h.handleServiceError(w, err, "Failed to get search stats")
-		return
-	}
-
-	h.sendSuccess(w, http.StatusOK, stats)
-}
-
-// ======================================================================
-= Record Search (optional endpoint for client-side logging)
+= Record Search (for analytics)
 // ======================================================================
 
 // RecordSearch handles recording a user's search query.
@@ -367,8 +414,7 @@ func (h *SearchHandler) RecordSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record search with default result count 0
-	if err := h.searchService.RecordSearch(r.Context(), req.Query, userID, 0); err != nil {
+	if err := h.searchService.RecordSearch(r.Context(), req.Query, userID, req.ResultCount); err != nil {
 		h.handleServiceError(w, err, "Failed to record search")
 		return
 	}
@@ -380,14 +426,96 @@ func (h *SearchHandler) RecordSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
+= Admin Search Stats
+// ======================================================================
+
+// AdminGetSearchStats handles retrieving search analytics.
+// @Summary Admin get search stats
+// @Description Returns search usage analytics (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Param granularity query string false "Granularity (hourly, daily, weekly) default daily"
+// @Success 200 {object} dto.SearchStatsResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/search/stats [get]
+func (h *SearchHandler) AdminGetSearchStats(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+	granularity := r.URL.Query().Get("granularity")
+	if granularity == "" {
+		granularity = "daily"
+	}
+
+	stats, err := h.searchService.GetSearchStats(r.Context(), days, granularity)
+	if err != nil {
+		h.handleServiceError(w, err, "Failed to get search stats")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, stats)
+}
+
+// ======================================================================
+= Admin Clear Search Cache
+// ======================================================================
+
+// AdminClearSearchCache handles clearing search cache.
+// @Summary Admin clear search cache
+// @Description Clears all search caches (admin only)
+// @Tags admin
+// @Security BearerAuth
+// @Produce json
+// @Param type query string false "Cache type (tweets, users, hashtags, all) default all"
+// @Success 200 {object} dto.SuccessResponse
+// @Failure 401 {object} dto.ErrorResponse
+// @Failure 403 {object} dto.ErrorResponse
+// @Failure 500 {object} dto.ErrorResponse
+// @Router /api/admin/search/clear-cache [post]
+func (h *SearchHandler) AdminClearSearchCache(w http.ResponseWriter, r *http.Request) {
+	// Check admin role
+	role, err := middleware.GetUserRole(r.Context())
+	if err != nil || role != "admin" {
+		h.sendError(w, http.StatusForbidden, "Admin access required", nil)
+		return
+	}
+
+	cacheType := r.URL.Query().Get("type")
+	if cacheType == "" {
+		cacheType = "all"
+	}
+
+	if err := h.searchService.ClearSearchCache(r.Context(), cacheType); err != nil {
+		h.handleServiceError(w, err, "Failed to clear search cache")
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Search cache cleared successfully",
+		"type":    cacheType,
+	})
+}
+
+// ======================================================================
 = Helper Methods
 // ======================================================================
 
 // parseSearchFilters parses search filters from query parameters.
 func (h *SearchHandler) parseSearchFilters(r *http.Request) *dto.SearchFilters {
 	filters := &dto.SearchFilters{}
-
-	// Query from URL param 'q' is handled separately
 
 	// Parse from query params
 	if from := r.URL.Query().Get("from"); from != "" {
@@ -422,10 +550,8 @@ func (h *SearchHandler) parseSearchFilters(r *http.Request) *dto.SearchFilters {
 // markTweetInteractions marks like, retweet, bookmark status for current user.
 func (h *SearchHandler) markTweetInteractions(ctx context.Context, tweets []*dto.TweetResponse, userID string) {
 	// This is a convenience; the service may already include these based on current user.
-	// If not, we could batch check interactions.
-	// For now, assume the service already populated these fields.
 	// If we need to populate them, we'd need to call like/retweet/bookmark services.
-	// We'll keep this as a placeholder for completeness.
+	// The search service should already handle this when currentUserID is provided.
 }
 
 // ======================================================================
@@ -471,13 +597,23 @@ func (h *SearchHandler) handleServiceError(w http.ResponseWriter, err error, def
 	case errors.Is(err, service.ErrSearchQueryEmpty):
 		h.sendError(w, http.StatusBadRequest, "Search query cannot be empty", nil)
 	case errors.Is(err, service.ErrSearchQueryTooShort):
-		h.sendError(w, http.StatusBadRequest, "Search query is too short", nil)
+		h.sendError(w, http.StatusBadRequest, "Search query is too short (minimum 2 characters)", nil)
 	case errors.Is(err, service.ErrSearchQueryTooLong):
-		h.sendError(w, http.StatusBadRequest, "Search query is too long", nil)
+		h.sendError(w, http.StatusBadRequest, "Search query is too long (maximum 200 characters)", nil)
 	case errors.Is(err, service.ErrSearchInvalidFilter):
 		h.sendError(w, http.StatusBadRequest, "Invalid search filter", nil)
 	case errors.Is(err, service.ErrSearchNoResults):
 		h.sendError(w, http.StatusNotFound, "No results found", nil)
+	case errors.Is(err, service.ErrInvalidSortBy):
+		h.sendError(w, http.StatusBadRequest, "Invalid sort by parameter", nil)
+	case errors.Is(err, service.ErrInvalidGranularity):
+		h.sendError(w, http.StatusBadRequest, "Invalid granularity parameter", nil)
+	case errors.Is(err, service.ErrCacheClearFailed):
+		h.sendError(w, http.StatusInternalServerError, "Failed to clear cache", nil)
+	case errors.Is(err, service.ErrUserNotFound):
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
+	case errors.Is(err, service.ErrTweetNotFound):
+		h.sendError(w, http.StatusNotFound, "Tweet not found", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
