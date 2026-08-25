@@ -118,7 +118,7 @@ func (h *ReportHandler) CreateReport(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================================================================
-= Get Reports (User's own)
+= Get My Reports
 // ======================================================================
 
 // GetMyReports handles retrieving reports filed by the authenticated user.
@@ -130,6 +130,7 @@ func (h *ReportHandler) CreateReport(w http.ResponseWriter, r *http.Request) {
 // @Param cursor query string false "Pagination cursor"
 // @Param limit query int false "Items per page (default 20, max 100)"
 // @Param status query string false "Filter by status"
+// @Param target_type query string false "Filter by target type"
 // @Success 200 {object} dto.ReportListResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -147,15 +148,36 @@ func (h *ReportHandler) GetMyReports(w http.ResponseWriter, r *http.Request) {
 		limit = 20
 	}
 	status := r.URL.Query().Get("status")
+	targetType := r.URL.Query().Get("target_type")
 
-	reports, nextCursor, total, err := h.reportService.GetMyReports(r.Context(), userID, cursor, limit, status)
+	reports, nextCursor, total, err := h.reportService.GetMyReports(r.Context(), userID, cursor, limit, status, targetType)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get reports")
 		return
 	}
 
+	// Convert to response
+	responses := make([]*dto.ReportResponse, 0, len(reports))
+	for _, rpt := range reports {
+		responses = append(responses, &dto.ReportResponse{
+			ID:          rpt.ID,
+			ReporterID:  rpt.ReporterID,
+			TargetID:    rpt.TargetID,
+			TargetType:  rpt.TargetType,
+			Reason:      rpt.Reason,
+			Description: rpt.Description,
+			Status:      rpt.Status,
+			Severity:    rpt.Severity,
+			ReviewerID:  rpt.ReviewerID,
+			ReviewNotes: rpt.ReviewNotes,
+			CreatedAt:   rpt.CreatedAt,
+			UpdatedAt:   rpt.UpdatedAt,
+			ResolvedAt:  rpt.ResolvedAt,
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        reports,
+		"data":        responses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -194,9 +216,9 @@ func (h *ReportHandler) GetReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get user role
+	// Check permission (admin or reporter)
 	role, _ := middleware.GetUserRole(r.Context())
-	isAdmin := role == "admin"
+	isAdmin := role == "admin" || role == "moderator"
 
 	report, err := h.reportService.GetReport(r.Context(), reportID, userID, isAdmin)
 	if err != nil {
@@ -204,14 +226,48 @@ func (h *ReportHandler) GetReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	// Get reporter info
+	reporter, _ := h.userService.GetUserByID(r.Context(), report.ReporterID)
+	reviewer, _ := h.userService.GetUserByID(r.Context(), report.ReviewerID)
+
+	detailResponse := &dto.ReportDetailResponse{
+		Report: &dto.ReportResponse{
+			ID:          report.ID,
+			ReporterID:  report.ReporterID,
+			TargetID:    report.TargetID,
+			TargetType:  report.TargetType,
+			Reason:      report.Reason,
+			Description: report.Description,
+			Status:      report.Status,
+			Severity:    report.Severity,
+			ReviewerID:  report.ReviewerID,
+			ReviewNotes: report.ReviewNotes,
+			CreatedAt:   report.CreatedAt,
+			UpdatedAt:   report.UpdatedAt,
+			ResolvedAt:  report.ResolvedAt,
+		},
+		ReporterUsername: func() string {
+			if reporter != nil {
+				return reporter.Username
+			}
+			return ""
+		}(),
+		ReviewerUsername: func() string {
+			if reviewer != nil {
+				return reviewer.Username
+			}
+			return ""
+		}(),
+	}
+
+	h.sendSuccess(w, http.StatusOK, detailResponse)
 }
 
 // ======================================================================
 = Update Report Status
 // ======================================================================
 
-// UpdateReportStatus handles updating a report's status (admin/moderator).
+// UpdateReportStatus handles updating a report's status.
 // @Summary Update report status
 // @Description Updates the status of a report (admin/moderator only)
 // @Tags reports
@@ -265,14 +321,31 @@ func (h *ReportHandler) UpdateReportStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	// Convert to response
+	resp := &dto.ReportResponse{
+		ID:          report.ID,
+		ReporterID:  report.ReporterID,
+		TargetID:    report.TargetID,
+		TargetType:  report.TargetType,
+		Reason:      report.Reason,
+		Description: report.Description,
+		Status:      report.Status,
+		Severity:    report.Severity,
+		ReviewerID:  report.ReviewerID,
+		ReviewNotes: report.ReviewNotes,
+		CreatedAt:   report.CreatedAt,
+		UpdatedAt:   report.UpdatedAt,
+		ResolvedAt:  report.ResolvedAt,
+	}
+
+	h.sendSuccess(w, http.StatusOK, resp)
 }
 
 // ======================================================================
-= Update Report Severity (Admin)
+= Update Report Severity
 // ======================================================================
 
-// UpdateReportSeverity handles updating a report's severity (admin).
+// UpdateReportSeverity handles updating a report's severity.
 // @Summary Update report severity
 // @Description Updates the severity of a report (admin only)
 // @Tags reports
@@ -326,11 +399,27 @@ func (h *ReportHandler) UpdateReportSeverity(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	resp := &dto.ReportResponse{
+		ID:          report.ID,
+		ReporterID:  report.ReporterID,
+		TargetID:    report.TargetID,
+		TargetType:  report.TargetType,
+		Reason:      report.Reason,
+		Description: report.Description,
+		Status:      report.Status,
+		Severity:    report.Severity,
+		ReviewerID:  report.ReviewerID,
+		ReviewNotes: report.ReviewNotes,
+		CreatedAt:   report.CreatedAt,
+		UpdatedAt:   report.UpdatedAt,
+		ResolvedAt:  report.ResolvedAt,
+	}
+
+	h.sendSuccess(w, http.StatusOK, resp)
 }
 
 // ======================================================================
-= Assign Report (Admin)
+= Assign Report
 // ======================================================================
 
 // AssignReport handles assigning a report to a reviewer.
@@ -381,17 +470,40 @@ func (h *ReportHandler) AssignReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify reviewer exists
+	_, err = h.userService.GetUserByID(r.Context(), req.ReviewerID)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "Reviewer user not found", nil)
+		return
+	}
+
 	report, err := h.reportService.AssignReport(r.Context(), reportID, userID, req.ReviewerID)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to assign report")
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	resp := &dto.ReportResponse{
+		ID:          report.ID,
+		ReporterID:  report.ReporterID,
+		TargetID:    report.TargetID,
+		TargetType:  report.TargetType,
+		Reason:      report.Reason,
+		Description: report.Description,
+		Status:      report.Status,
+		Severity:    report.Severity,
+		ReviewerID:  report.ReviewerID,
+		ReviewNotes: report.ReviewNotes,
+		CreatedAt:   report.CreatedAt,
+		UpdatedAt:   report.UpdatedAt,
+		ResolvedAt:  report.ResolvedAt,
+	}
+
+	h.sendSuccess(w, http.StatusOK, resp)
 }
 
 // ======================================================================
-= Resolve Report (Admin/Moderator)
+= Resolve Report
 // ======================================================================
 
 // ResolveReport handles resolving a report.
@@ -449,20 +561,31 @@ func (h *ReportHandler) ResolveReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If action involves deleting tweet, perform it
-	if req.Action == "delete_tweet" {
-		// Get target details from report
-		// For simplicity, we assume the report target is a tweet
-		targetID := report.TargetID
-		if report.TargetType == "tweet" {
-			_ = h.tweetService.DeleteTweet(r.Context(), targetID, userID) // admin has permission
-		}
+	if req.Action == "delete_tweet" && report.TargetType == "tweet" {
+		_ = h.tweetService.DeleteTweet(r.Context(), report.TargetID, userID)
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	resp := &dto.ReportResponse{
+		ID:          report.ID,
+		ReporterID:  report.ReporterID,
+		TargetID:    report.TargetID,
+		TargetType:  report.TargetType,
+		Reason:      report.Reason,
+		Description: report.Description,
+		Status:      report.Status,
+		Severity:    report.Severity,
+		ReviewerID:  report.ReviewerID,
+		ReviewNotes: report.ReviewNotes,
+		CreatedAt:   report.CreatedAt,
+		UpdatedAt:   report.UpdatedAt,
+		ResolvedAt:  report.ResolvedAt,
+	}
+
+	h.sendSuccess(w, http.StatusOK, resp)
 }
 
 // ======================================================================
-= Dismiss Report (Admin/Moderator)
+= Dismiss Report
 // ======================================================================
 
 // DismissReport handles dismissing a report.
@@ -519,7 +642,23 @@ func (h *ReportHandler) DismissReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.sendSuccess(w, http.StatusOK, report)
+	resp := &dto.ReportResponse{
+		ID:          report.ID,
+		ReporterID:  report.ReporterID,
+		TargetID:    report.TargetID,
+		TargetType:  report.TargetType,
+		Reason:      report.Reason,
+		Description: report.Description,
+		Status:      report.Status,
+		Severity:    report.Severity,
+		ReviewerID:  report.ReviewerID,
+		ReviewNotes: report.ReviewNotes,
+		CreatedAt:   report.CreatedAt,
+		UpdatedAt:   report.UpdatedAt,
+		ResolvedAt:  report.ResolvedAt,
+	}
+
+	h.sendSuccess(w, http.StatusOK, resp)
 }
 
 // ======================================================================
@@ -567,8 +706,42 @@ func (h *ReportHandler) AdminListReports(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Convert to response
+	responses := make([]*dto.ReportAdminResponse, 0, len(reports))
+	for _, rpt := range reports {
+		reporter, _ := h.userService.GetUserByID(r.Context(), rpt.ReporterID)
+		reviewer, _ := h.userService.GetUserByID(r.Context(), rpt.ReviewerID)
+		responses = append(responses, &dto.ReportAdminResponse{
+			ID:               rpt.ID,
+			ReporterID:       rpt.ReporterID,
+			TargetID:         rpt.TargetID,
+			TargetType:       rpt.TargetType,
+			Reason:           rpt.Reason,
+			Description:      rpt.Description,
+			Status:           rpt.Status,
+			Severity:         rpt.Severity,
+			ReviewerID:       rpt.ReviewerID,
+			ReviewNotes:      rpt.ReviewNotes,
+			CreatedAt:        rpt.CreatedAt,
+			UpdatedAt:        rpt.UpdatedAt,
+			ResolvedAt:       rpt.ResolvedAt,
+			ReporterUsername: func() string {
+				if reporter != nil {
+					return reporter.Username
+				}
+				return ""
+			}(),
+			ReviewerUsername: func() string {
+				if reviewer != nil {
+					return reviewer.Username
+				}
+				return ""
+			}(),
+		})
+	}
+
 	h.sendSuccess(w, http.StatusOK, map[string]interface{}{
-		"data":        reports,
+		"data":        responses,
 		"next_cursor": nextCursor,
 		"has_more":    nextCursor != "",
 		"limit":       limit,
@@ -586,7 +759,8 @@ func (h *ReportHandler) AdminListReports(w http.ResponseWriter, r *http.Request)
 // @Tags admin
 // @Security BearerAuth
 // @Produce json
-// @Success 200 {object} dto.GlobalReportStatsResponse
+// @Param days query int false "Number of days to analyze (default 7, max 30)"
+// @Success 200 {object} dto.ReportStatsResponse
 // @Failure 401 {object} dto.ErrorResponse
 // @Failure 403 {object} dto.ErrorResponse
 // @Failure 500 {object} dto.ErrorResponse
@@ -599,7 +773,12 @@ func (h *ReportHandler) AdminGetReportStats(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	stats, err := h.reportService.AdminGetReportStats(r.Context())
+	days, err := strconv.Atoi(r.URL.Query().Get("days"))
+	if err != nil || days < 1 || days > 30 {
+		days = 7
+	}
+
+	stats, err := h.reportService.AdminGetReportStats(r.Context(), days)
 	if err != nil {
 		h.handleServiceError(w, err, "Failed to get report stats")
 		return
@@ -710,6 +889,14 @@ func (h *ReportHandler) handleServiceError(w http.ResponseWriter, err error, def
 		h.sendError(w, http.StatusBadRequest, "Invalid target type", nil)
 	case errors.Is(err, service.ErrReportPermissionDenied):
 		h.sendError(w, http.StatusForbidden, "Permission denied", nil)
+	case errors.Is(err, service.ErrReportAlreadyAssigned):
+		h.sendError(w, http.StatusBadRequest, "Report already assigned", nil)
+	case errors.Is(err, service.ErrInvalidReviewerID):
+		h.sendError(w, http.StatusBadRequest, "Invalid reviewer ID", nil)
+	case errors.Is(err, service.ErrUserNotFound):
+		h.sendError(w, http.StatusNotFound, "User not found", nil)
+	case errors.Is(err, service.ErrTweetNotFound):
+		h.sendError(w, http.StatusNotFound, "Tweet not found", nil)
 	case errors.Is(err, context.Canceled):
 		h.sendError(w, http.StatusRequestTimeout, "Request cancelled", nil)
 	case errors.Is(err, context.DeadlineExceeded):
