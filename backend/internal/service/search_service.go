@@ -3,7 +3,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,18 +26,25 @@ const (
 	DefaultSearchResults = 20
 	MinSearchQueryLength = 2
 	MaxSearchQueryLength = 200
+	MaxSuggestionsLimit  = 20
+	DefaultSuggestionsLimit = 10
+	MaxTrendingLimit     = 50
+	DefaultTrendingLimit = 10
 )
 
 var (
-	ErrSearchQueryTooShort = fmt.Errorf("search query must be at least %d characters", MinSearchQueryLength)
-	ErrSearchQueryTooLong  = fmt.Errorf("search query must be at most %d characters", MaxSearchQueryLength)
-	ErrSearchQueryEmpty    = errors.New("search query cannot be empty")
-	ErrSearchInvalidFilter = errors.New("invalid search filter")
-	ErrSearchNoResults     = errors.New("no results found")
+	ErrSearchQueryEmpty      = errors.New("search query cannot be empty")
+	ErrSearchQueryTooShort   = fmt.Errorf("search query must be at least %d characters", MinSearchQueryLength)
+	ErrSearchQueryTooLong    = fmt.Errorf("search query must be at most %d characters", MaxSearchQueryLength)
+	ErrSearchInvalidFilter   = errors.New("invalid search filter")
+	ErrSearchNoResults       = errors.New("no results found")
+	ErrSearchTimeout         = errors.New("search operation timed out")
+	ErrInvalidSearchType     = errors.New("invalid search type")
+	ErrUserNotFound          = errors.New("user not found")
 )
 
 // ======================================================================
-= SearchService Interface
+// SearchService Interface
 // ======================================================================
 
 // SearchService defines the search service interface.
@@ -69,7 +75,7 @@ type SearchService interface {
 }
 
 // ======================================================================
-= SearchService Implementation
+// searchService Implementation
 // ======================================================================
 
 // searchService implements SearchService.
@@ -98,7 +104,7 @@ func NewSearchService(
 }
 
 // ======================================================================
-= Search Tweets
+// Search Tweets
 // ======================================================================
 
 // SearchTweets searches for tweets matching the query.
@@ -107,14 +113,11 @@ func (s *searchService) SearchTweets(ctx context.Context, query string, filters 
 	if err := s.validateQuery(query); err != nil {
 		return nil, "", 0, err
 	}
-	
 	if limit < 1 || limit > MaxSearchResults {
 		limit = DefaultSearchResults
 	}
-	
 	// Build cache key
 	cacheKey := s.buildTweetCacheKey(query, filters, cursor, limit)
-	
 	// Try cache first
 	if s.redisAdapter != nil {
 		var cached struct {
@@ -127,16 +130,13 @@ func (s *searchService) SearchTweets(ctx context.Context, query string, filters 
 			return cached.Tweets, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Parse query for filters and operators
 	parsedQuery := s.parseSearchQuery(query)
-	
 	// Build search query
 	searchQuery := parsedQuery.Text
 	if searchQuery == "" {
 		searchQuery = query
 	}
-	
 	// Apply filters from parsed query
 	if filters == nil {
 		filters = &dto.SearchFilters{}
@@ -157,16 +157,13 @@ func (s *searchService) SearchTweets(ctx context.Context, query string, filters 
 	filters.IncludeRetweets = parsedQuery.IncludeRetweets
 	filters.MediaOnly = parsedQuery.MediaOnly
 	filters.Query = searchQuery
-	
 	// Get tweets from repository
 	tweets, nextCursor, err := s.tweetRepo.Search(ctx, searchQuery, cursor, limit)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to search tweets: %w", err)
 	}
-	
 	// Filter results
 	filteredTweets := s.applyTweetFilters(tweets, filters)
-	
 	// Build responses
 	responses := make([]*dto.TweetResponse, 0, len(filteredTweets))
 	for _, tweet := range filteredTweets {
@@ -177,10 +174,8 @@ func (s *searchService) SearchTweets(ctx context.Context, query string, filters 
 		}
 		responses = append(responses, resp)
 	}
-	
 	// Get total count
 	total := int64(len(responses))
-	
 	// Cache for 1 minute
 	if s.redisAdapter != nil && len(responses) > 0 {
 		cacheData := struct {
@@ -194,15 +189,13 @@ func (s *searchService) SearchTweets(ctx context.Context, query string, filters 
 		}
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 1*time.Minute)
 	}
-	
 	// Record search for analytics
 	_ = s.RecordSearch(ctx, query, "", total)
-	
 	return responses, nextCursor, total, nil
 }
 
 // ======================================================================
-= Search Users
+// Search Users
 // ======================================================================
 
 // SearchUsers searches for users matching the query.
@@ -211,14 +204,11 @@ func (s *searchService) SearchUsers(ctx context.Context, query string, cursor st
 	if err := s.validateQuery(query); err != nil {
 		return nil, "", 0, err
 	}
-	
 	if limit < 1 || limit > MaxSearchResults {
 		limit = DefaultSearchResults
 	}
-	
 	// Build cache key
 	cacheKey := fmt.Sprintf("user_search:%s:%s:%d", query, cursor, limit)
-	
 	// Try cache first
 	if s.redisAdapter != nil {
 		var cached struct {
@@ -230,46 +220,40 @@ func (s *searchService) SearchUsers(ctx context.Context, query string, cursor st
 			return cached.Users, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Search users from repository
 	users, total, err := s.userRepo.Search(ctx, query, nil)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to search users: %w", err)
 	}
-	
 	// Build responses
 	responses := make([]*dto.UserSearchResponse, 0, len(users))
 	for _, user := range users {
 		// Check if current user follows this user
 		isFollowing := false
-		if currentUserID != "" {
+		if currentUserID != "" && currentUserID != user.ID {
 			isFollowing, _ = s.followRepo.Exists(ctx, currentUserID, user.ID)
 		}
-		
 		// Check if mutual
 		isMutual := false
 		if currentUserID != "" && isFollowing {
 			mutual, _ := s.followRepo.AreMutual(ctx, currentUserID, user.ID)
 			isMutual = mutual
 		}
-		
 		responses = append(responses, &dto.UserSearchResponse{
-			ID:          user.ID,
-			Username:    user.Username,
-			FullName:    user.FullName,
-			AvatarURL:   user.AvatarURL,
-			Bio:         user.Bio,
-			IsVerified:  user.IsVerified,
-			IsFollowing: isFollowing,
-			IsMutual:    isMutual,
+			ID:            user.ID,
+			Username:      user.Username,
+			FullName:      user.FullName,
+			AvatarURL:     user.AvatarURL,
+			Bio:           user.Bio,
+			IsVerified:    user.IsVerified,
+			IsFollowing:   isFollowing,
+			IsMutual:      isMutual,
 			FollowerCount: user.FollowerCount,
-			TweetCount:  user.TweetCount,
+			TweetCount:    user.TweetCount,
 		})
 	}
-	
 	// Get total count
 	total = int64(len(responses))
-	
 	// Cache for 5 minutes
 	if s.redisAdapter != nil && len(responses) > 0 {
 		cacheData := struct {
@@ -283,15 +267,13 @@ func (s *searchService) SearchUsers(ctx context.Context, query string, cursor st
 		}
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 5*time.Minute)
 	}
-	
 	// Record search
 	_ = s.RecordSearch(ctx, query, currentUserID, total)
-	
 	return responses, "", total, nil
 }
 
 // ======================================================================
-= Search Hashtags
+// Search Hashtags
 // ======================================================================
 
 // SearchHashtags searches for hashtags matching the query.
@@ -300,14 +282,11 @@ func (s *searchService) SearchHashtags(ctx context.Context, query string, cursor
 	if err := s.validateQuery(query); err != nil {
 		return nil, "", 0, err
 	}
-	
 	if limit < 1 || limit > MaxSearchResults {
 		limit = DefaultSearchResults
 	}
-	
 	// Build cache key
 	cacheKey := fmt.Sprintf("hashtag_search:%s:%s:%d", query, cursor, limit)
-	
 	// Try cache first
 	if s.redisAdapter != nil {
 		var cached struct {
@@ -319,17 +298,14 @@ func (s *searchService) SearchHashtags(ctx context.Context, query string, cursor
 			return cached.Hashtags, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Clean and format query
 	cleanQuery := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(query)), "#")
-	
 	// Search for hashtags from tweets (this would be more efficient with a dedicated hashtag table)
 	// For now, we'll get trending and filter
 	trends, err := s.tweetRepo.GetTrending(ctx, 50)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to get hashtags: %w", err)
 	}
-	
 	// Filter and rank
 	responses := make([]*dto.HashtagResponse, 0)
 	for _, trend := range trends {
@@ -341,7 +317,6 @@ func (s *searchService) SearchHashtags(ctx context.Context, query string, cursor
 			})
 		}
 	}
-	
 	// Sort by count
 	for i := 0; i < len(responses); i++ {
 		for j := i + 1; j < len(responses); j++ {
@@ -350,14 +325,11 @@ func (s *searchService) SearchHashtags(ctx context.Context, query string, cursor
 			}
 		}
 	}
-	
 	// Limit
 	if len(responses) > limit {
 		responses = responses[:limit]
 	}
-	
 	total := int64(len(responses))
-	
 	// Cache for 5 minutes
 	if s.redisAdapter != nil && len(responses) > 0 {
 		cacheData := struct {
@@ -371,12 +343,11 @@ func (s *searchService) SearchHashtags(ctx context.Context, query string, cursor
 		}
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 5*time.Minute)
 	}
-	
 	return responses, "", total, nil
 }
 
 // ======================================================================
-= Search All
+// Search All
 // ======================================================================
 
 // SearchAll performs a combined search across tweets, users, and hashtags.
@@ -385,7 +356,6 @@ func (s *searchService) SearchAll(ctx context.Context, query string, cursor stri
 	if err := s.validateQuery(query); err != nil {
 		return nil, err
 	}
-	
 	// Determine limits for each category
 	tweetLimit := limit
 	userLimit := limit / 2
@@ -396,7 +366,6 @@ func (s *searchService) SearchAll(ctx context.Context, query string, cursor stri
 	if hashtagLimit < 1 {
 		hashtagLimit = 1
 	}
-	
 	// Search tweets
 	tweets, _, tweetTotal, err := s.SearchTweets(ctx, query, nil, cursor, tweetLimit)
 	if err != nil {
@@ -404,7 +373,6 @@ func (s *searchService) SearchAll(ctx context.Context, query string, cursor stri
 		tweets = []*dto.TweetResponse{}
 		tweetTotal = 0
 	}
-	
 	// Search users
 	users, _, userTotal, err := s.SearchUsers(ctx, query, "", userLimit, currentUserID)
 	if err != nil {
@@ -412,7 +380,6 @@ func (s *searchService) SearchAll(ctx context.Context, query string, cursor stri
 		users = []*dto.UserSearchResponse{}
 		userTotal = 0
 	}
-	
 	// Search hashtags
 	hashtags, _, hashtagTotal, err := s.SearchHashtags(ctx, query, "", hashtagLimit)
 	if err != nil {
@@ -420,7 +387,6 @@ func (s *searchService) SearchAll(ctx context.Context, query string, cursor stri
 		hashtags = []*dto.HashtagResponse{}
 		hashtagTotal = 0
 	}
-	
 	return &dto.CombinedSearchResponse{
 		Query:         query,
 		Tweets:        tweets,
@@ -442,14 +408,12 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 	if limit < 1 || limit > 20 {
 		limit = 10
 	}
-	
 	if len(strings.TrimSpace(query)) < 2 {
 		return &dto.SearchSuggestionsResponse{
 			Query:       query,
 			Suggestions: []string{},
 		}, nil
 	}
-	
 	// Build cache key
 	cacheKey := fmt.Sprintf("suggestions:%s:%d", query, limit)
 	if s.redisAdapter != nil {
@@ -458,9 +422,7 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 			return &cached, nil
 		}
 	}
-	
 	suggestions := make([]string, 0)
-	
 	// Get user suggestions
 	users, _, _, err := s.SearchUsers(ctx, query, "", limit, "")
 	if err == nil {
@@ -468,7 +430,6 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 			suggestions = append(suggestions, "@"+user.Username)
 		}
 	}
-	
 	// Get hashtag suggestions
 	hashtags, _, _, err := s.SearchHashtags(ctx, query, "", limit)
 	if err == nil {
@@ -476,7 +437,6 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 			suggestions = append(suggestions, tag.Hashtag)
 		}
 	}
-	
 	// Get common search queries from Redis
 	if s.redisAdapter != nil {
 		// Get trending searches
@@ -487,7 +447,6 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 			}
 		}
 	}
-	
 	// Remove duplicates
 	seen := make(map[string]bool)
 	unique := make([]string, 0, len(suggestions))
@@ -497,21 +456,17 @@ func (s *searchService) GetSearchSuggestions(ctx context.Context, query string, 
 			unique = append(unique, s)
 		}
 	}
-	
 	if len(unique) > limit {
 		unique = unique[:limit]
 	}
-	
 	response := &dto.SearchSuggestionsResponse{
 		Query:       query,
 		Suggestions: unique,
 	}
-	
 	// Cache for 1 hour
 	if s.redisAdapter != nil {
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, response, 1*time.Hour)
 	}
-	
 	return response, nil
 }
 
@@ -524,7 +479,6 @@ func (s *searchService) GetTrendingSearches(ctx context.Context, limit int) ([]*
 	if limit < 1 || limit > 50 {
 		limit = 10
 	}
-	
 	// Try cache first
 	cacheKey := fmt.Sprintf("trending_searches:%d", limit)
 	if s.redisAdapter != nil {
@@ -533,14 +487,12 @@ func (s *searchService) GetTrendingSearches(ctx context.Context, limit int) ([]*
 			return cached, nil
 		}
 	}
-	
 	// Get from Redis (we store search history in sorted sets)
 	trending, err := s.getTrendingSearchesFromCache(ctx, limit)
 	if err != nil {
 		// Fallback: use empty list
 		trending = []string{}
 	}
-	
 	responses := make([]*dto.TrendingSearchResponse, 0, len(trending))
 	for i, term := range trending {
 		// Get count for each term
@@ -551,12 +503,10 @@ func (s *searchService) GetTrendingSearches(ctx context.Context, limit int) ([]*
 			Position: i + 1,
 		})
 	}
-	
 	// Cache for 15 minutes
 	if s.redisAdapter != nil && len(responses) > 0 {
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, responses, 15*time.Minute)
 	}
-	
 	return responses, nil
 }
 
@@ -574,18 +524,16 @@ func (s *searchService) GetSearchStats(ctx context.Context) (*dto.SearchStatsRes
 			return &cached, nil
 		}
 	}
-	
 	// Get stats from Redis
 	totalSearches, _ := s.getTotalSearches(ctx)
 	uniqueSearches, _ := s.getUniqueSearches(ctx)
 	topQueries, _ := s.getTrendingSearchesFromCache(ctx, 10)
-	
 	// Get daily search counts (last 7 days)
 	dailyCounts := []*dto.DailySearchCount{}
 	for i := 6; i >= 0; i-- {
 		date := time.Now().AddDate(0, 0, -i)
 		key := fmt.Sprintf("search:date:%s", date.Format("2006-01-02"))
-		count, _ := s.redisAdapter.Get(ctx, key)
+		count, err := s.redisAdapter.Get(ctx, key)
 		var cnt int64
 		fmt.Sscanf(count, "%d", &cnt)
 		dailyCounts = append(dailyCounts, &dto.DailySearchCount{
@@ -593,19 +541,16 @@ func (s *searchService) GetSearchStats(ctx context.Context) (*dto.SearchStatsRes
 			Count: cnt,
 		})
 	}
-	
 	response := &dto.SearchStatsResponse{
 		TotalSearches:  totalSearches,
 		UniqueSearches: uniqueSearches,
 		TopQueries:     topQueries,
 		DailyCounts:    dailyCounts,
 	}
-	
 	// Cache for 1 hour
 	if s.redisAdapter != nil {
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, response, 1*time.Hour)
 	}
-	
 	return response, nil
 }
 
@@ -618,45 +563,36 @@ func (s *searchService) RecordSearch(ctx context.Context, query string, userID s
 	if s.redisAdapter == nil {
 		return nil
 	}
-	
 	// Normalize query
 	query = strings.ToLower(strings.TrimSpace(query))
 	if query == "" || len(query) < 3 {
 		return nil
 	}
-	
 	// Increment total searches
 	_ = s.redisAdapter.Incr(ctx, "search:total")
-	
 	// Increment query count (sorted set for trending)
 	_ = s.redisAdapter.ZIncrBy(ctx, "search:trending", 1, query)
-	
 	// Add to daily count
 	dateKey := fmt.Sprintf("search:date:%s", time.Now().Format("2006-01-02"))
 	_ = s.redisAdapter.Incr(ctx, dateKey)
 	_ = s.redisAdapter.Expire(ctx, dateKey, 30*24*time.Hour)
-	
 	// Record user search if userID provided
 	if userID != "" {
 		userKey := fmt.Sprintf("search:user:%s", userID)
 		_ = s.redisAdapter.ZAdd(ctx, userKey, float64(time.Now().Unix()), query)
 		_ = s.redisAdapter.Expire(ctx, userKey, 30*24*time.Hour)
 	}
-	
 	// Store query with result count
 	if resultCount > 0 {
 		_ = s.redisAdapter.ZAdd(ctx, "search:results", float64(resultCount), query)
 	}
-	
 	// Increment unique searches (hash)
 	_ = s.redisAdapter.SAdd(ctx, "search:unique", query)
-	
 	s.log.WithFields(logrus.Fields{
 		"query":        query,
 		"user_id":      userID,
 		"result_count": resultCount,
 	}).Debug("Search recorded")
-	
 	return nil
 }
 
@@ -718,10 +654,8 @@ func (s *searchService) parseSearchQuery(query string) *ParsedSearchQuery {
 		IncludeReplies:  true,
 		IncludeRetweets: true,
 	}
-	
 	parts := strings.Fields(query)
 	var textParts []string
-	
 	for _, part := range parts {
 		switch {
 		case strings.HasPrefix(part, "from:"):
@@ -752,11 +686,9 @@ func (s *searchService) parseSearchQuery(query string) *ParsedSearchQuery {
 			textParts = append(textParts, part)
 		}
 	}
-	
 	if len(textParts) > 0 {
 		result.Text = strings.Join(textParts, " ")
 	}
-	
 	return result
 }
 
@@ -765,25 +697,20 @@ func (s *searchService) applyTweetFilters(tweets []*entities.Tweet, filters *dto
 	if filters == nil {
 		return tweets
 	}
-	
 	var filtered []*entities.Tweet
-	
 	for _, tweet := range tweets {
 		// Filter by replies
 		if !filters.IncludeReplies && tweet.ParentTweetID != nil && *tweet.ParentTweetID != "" {
 			continue
 		}
-		
 		// Filter by retweets
 		if !filters.IncludeRetweets && tweet.RetweetOfID != nil && *tweet.RetweetOfID != "" {
 			continue
 		}
-		
 		// Filter by media
 		if filters.MediaOnly && len(tweet.MediaURLs) == 0 {
 			continue
 		}
-		
 		// Filter by date
 		if !filters.Since.IsZero() && tweet.CreatedAt.Before(filters.Since) {
 			continue
@@ -791,37 +718,28 @@ func (s *searchService) applyTweetFilters(tweets []*entities.Tweet, filters *dto
 		if !filters.Until.IsZero() && tweet.CreatedAt.After(filters.Until) {
 			continue
 		}
-		
 		filtered = append(filtered, tweet)
 	}
-	
 	return filtered
 }
 
 // buildTweetResponse builds a tweet response DTO.
 func (s *searchService) buildTweetResponse(ctx context.Context, tweet *entities.Tweet, currentUserID string) (*dto.TweetResponse, error) {
-	// Get user
 	user, err := s.userRepo.GetByID(ctx, tweet.UserID)
 	if err != nil {
 		return nil, err
 	}
-	
-	// Get counts
 	likeCount, _ := s.tweetRepo.GetLikeCount(ctx, tweet.ID)
 	retweetCount, _ := s.tweetRepo.GetRetweetCount(ctx, tweet.ID)
 	replyCount, _ := s.tweetRepo.CountReplies(ctx, tweet.ID)
-	
-	// Check interaction status
 	liked := false
 	retweeted := false
 	bookmarked := false
-	
 	if currentUserID != "" {
-		liked, _ = s.tweetRepo.IsLiked(ctx, tweet.ID, currentUserID)
-		retweeted, _ = s.tweetRepo.IsRetweeted(ctx, tweet.ID, currentUserID)
-		bookmarked, _ = s.tweetRepo.IsBookmarked(ctx, tweet.ID, currentUserID)
+		liked, _ = s.likeRepo.Exists(ctx, tweet.ID, currentUserID)
+		retweeted, _ = s.retweetRepo.Exists(ctx, tweet.ID, currentUserID)
+		bookmarked, _ = s.bookmarkRepo.Exists(ctx, tweet.ID, currentUserID)
 	}
-	
 	return &dto.TweetResponse{
 		ID:           tweet.ID,
 		Content:      tweet.Content,
@@ -846,7 +764,6 @@ func (s *searchService) getTrendingSearchesFromCache(ctx context.Context, limit 
 	if s.redisAdapter == nil {
 		return []string{}, nil
 	}
-	
 	results, err := s.redisAdapter.ZRevRange(ctx, "search:trending", 0, int64(limit-1))
 	if err != nil {
 		return []string{}, err
@@ -859,7 +776,6 @@ func (s *searchService) getSearchCount(ctx context.Context, query string) (int64
 	if s.redisAdapter == nil {
 		return 0, nil
 	}
-	
 	score, err := s.redisAdapter.ZScore(ctx, "search:trending", query)
 	if err != nil {
 		return 0, nil
@@ -872,7 +788,6 @@ func (s *searchService) getTotalSearches(ctx context.Context) (int64, error) {
 	if s.redisAdapter == nil {
 		return 0, nil
 	}
-	
 	count, err := s.redisAdapter.Get(ctx, "search:total")
 	if err != nil {
 		return 0, nil
@@ -887,7 +802,6 @@ func (s *searchService) getUniqueSearches(ctx context.Context) (int64, error) {
 	if s.redisAdapter == nil {
 		return 0, nil
 	}
-	
 	count, err := s.redisAdapter.SCard(ctx, "search:unique")
 	if err != nil {
 		return 0, nil
@@ -896,7 +810,7 @@ func (s *searchService) getUniqueSearches(ctx context.Context) (int64, error) {
 }
 
 // ======================================================================
-= ParsedSearchQuery Struct
+// ParsedSearchQuery Struct
 // ======================================================================
 
 // ParsedSearchQuery represents a parsed search query with filters.
