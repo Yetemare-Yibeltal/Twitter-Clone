@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 
 	"twitter-clone/backend/internal/adapter"
@@ -48,39 +49,20 @@ var (
 
 // FeedService defines the feed service interface.
 type FeedService interface {
-	// GetHomeFeed returns the home feed for a user.
 	GetHomeFeed(ctx context.Context, userID, cursor string, limit int, includeReplies, includeRetweets bool) ([]*dto.TweetResponse, string, error)
-	
-	// GetUserFeed returns tweets from a specific user.
 	GetUserFeed(ctx context.Context, username, cursor string, limit int, includeReplies bool, currentUserID string) ([]*dto.TweetResponse, string, int64, error)
-	
-	// GetForYouFeed returns personalized feed recommendations.
 	GetForYouFeed(ctx context.Context, userID, cursor string, limit int) ([]*dto.TweetResponse, string, error)
-	
-	// GetTrendingFeed returns trending tweets.
 	GetTrendingFeed(ctx context.Context, limit int, since time.Time, currentUserID string) ([]*dto.TweetResponse, error)
-	
-	// GetFeedRecommendations returns recommended tweets.
 	GetFeedRecommendations(ctx context.Context, userID string, limit int) ([]*dto.TweetResponse, error)
-	
-	// GetFeedPreferences returns user's feed preferences.
 	GetFeedPreferences(ctx context.Context, userID string) (*dto.FeedPreferencesResponse, error)
-	
-	// UpdateFeedPreferences updates user's feed preferences.
 	UpdateFeedPreferences(ctx context.Context, userID string, req *dto.UpdateFeedPreferencesRequest) (*dto.FeedPreferencesResponse, error)
-	
-	// DismissFeedItem dismisses a tweet from the feed.
 	DismissFeedItem(ctx context.Context, userID, tweetID string) error
-	
-	// GetFeedMetrics returns feed performance metrics (admin).
 	GetFeedMetrics(ctx context.Context, days int) (*dto.FeedMetricsResponse, error)
-	
-	// GetUserFeedStats returns feed statistics for a user.
 	GetUserFeedStats(ctx context.Context, userID string) (*dto.UserFeedStatsResponse, error)
 }
 
 // ======================================================================
-// feedService Implementation
+// FeedService Implementation
 // ======================================================================
 
 // feedService implements FeedService.
@@ -121,7 +103,6 @@ func NewFeedService(
 // Get Home Feed
 // ======================================================================
 
-// GetHomeFeed returns the home feed for a user.
 func (s *feedService) GetHomeFeed(ctx context.Context, userID, cursor string, limit int, includeReplies, includeRetweets bool) ([]*dto.TweetResponse, string, error) {
 	if limit < 1 || limit > MaxFeedLimit {
 		limit = DefaultFeedLimit
@@ -179,7 +160,6 @@ func (s *feedService) GetHomeFeed(ctx context.Context, userID, cursor string, li
 // Get User Feed
 // ======================================================================
 
-// GetUserFeed returns tweets from a specific user.
 func (s *feedService) GetUserFeed(ctx context.Context, username, cursor string, limit int, includeReplies bool, currentUserID string) ([]*dto.TweetResponse, string, int64, error) {
 	if limit < 1 || limit > MaxFeedLimit {
 		limit = DefaultFeedLimit
@@ -214,7 +194,6 @@ func (s *feedService) GetUserFeed(ctx context.Context, username, cursor string, 
 // Get For You Feed (Personalized)
 // ======================================================================
 
-// GetForYouFeed returns personalized feed recommendations.
 func (s *feedService) GetForYouFeed(ctx context.Context, userID, cursor string, limit int) ([]*dto.TweetResponse, string, error) {
 	if limit < 1 || limit > MaxFeedLimit {
 		limit = DefaultFeedLimit
@@ -286,7 +265,6 @@ func (s *feedService) GetForYouFeed(ctx context.Context, userID, cursor string, 
 // Get Trending Feed
 // ======================================================================
 
-// GetTrendingFeed returns trending tweets.
 func (s *feedService) GetTrendingFeed(ctx context.Context, limit int, since time.Time, currentUserID string) ([]*dto.TweetResponse, error) {
 	if limit < 1 || limit > TrendingFeedLimit {
 		limit = 20
@@ -340,7 +318,6 @@ func (s *feedService) GetTrendingFeed(ctx context.Context, limit int, since time
 // Get Feed Recommendations
 // ======================================================================
 
-// GetFeedRecommendations returns recommended tweets.
 func (s *feedService) GetFeedRecommendations(ctx context.Context, userID string, limit int) ([]*dto.TweetResponse, error) {
 	if limit < 1 || limit > RecommendationLimit {
 		limit = RecommendationLimit
@@ -403,7 +380,6 @@ func (s *feedService) GetFeedRecommendations(ctx context.Context, userID string,
 // Feed Preferences
 // ======================================================================
 
-// GetFeedPreferences returns user's feed preferences.
 func (s *feedService) GetFeedPreferences(ctx context.Context, userID string) (*dto.FeedPreferencesResponse, error) {
 	cacheKey := fmt.Sprintf("feed_preferences:%s", userID)
 	if s.redisAdapter != nil {
@@ -446,7 +422,6 @@ func (s *feedService) GetFeedPreferences(ctx context.Context, userID string) (*d
 	return preferences, nil
 }
 
-// UpdateFeedPreferences updates user's feed preferences.
 func (s *feedService) UpdateFeedPreferences(ctx context.Context, userID string, req *dto.UpdateFeedPreferencesRequest) (*dto.FeedPreferencesResponse, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -481,7 +456,6 @@ func (s *feedService) UpdateFeedPreferences(ctx context.Context, userID string, 
 // Dismiss Feed Item
 // ======================================================================
 
-// DismissFeedItem dismisses a tweet from the feed.
 func (s *feedService) DismissFeedItem(ctx context.Context, userID, tweetID string) error {
 	// Store dismissed tweets in Redis set
 	if s.redisAdapter == nil {
@@ -506,7 +480,6 @@ func (s *feedService) DismissFeedItem(ctx context.Context, userID, tweetID strin
 // Get Feed Metrics (Admin)
 // ======================================================================
 
-// GetFeedMetrics returns feed performance metrics (admin).
 func (s *feedService) GetFeedMetrics(ctx context.Context, days int) (*dto.FeedMetricsResponse, error) {
 	if days < 1 || days > 30 {
 		days = DefaultDaysForMetrics
@@ -544,7 +517,6 @@ func (s *feedService) GetFeedMetrics(ctx context.Context, days int) (*dto.FeedMe
 // Get User Feed Stats
 // ======================================================================
 
-// GetUserFeedStats returns feed statistics for a user.
 func (s *feedService) GetUserFeedStats(ctx context.Context, userID string) (*dto.UserFeedStatsResponse, error) {
 	// Get user's tweet stats
 	tweetStats, err := s.tweetRepo.GetUserTweetStats(ctx, userID)
@@ -593,7 +565,7 @@ func (s *feedService) GetUserFeedStats(ctx context.Context, userID string) (*dto
 }
 
 // ======================================================================
-// Helper Methods
+= Helper Methods
 // ======================================================================
 
 // filterTweets filters tweets based on includeReplies and includeRetweets.
@@ -732,9 +704,10 @@ type ScoredTweet struct {
 }
 
 // ======================================================================
-// Global Instance
+// Service Registration
 // ======================================================================
 
+// Global feed service instance (optional)
 var defaultFeedService FeedService
 
 // InitFeedService initializes the global feed service.
