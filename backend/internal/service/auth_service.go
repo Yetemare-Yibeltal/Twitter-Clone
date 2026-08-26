@@ -7,9 +7,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 
@@ -21,7 +24,19 @@ import (
 	"twitter-clone/backend/pkg/logger"
 )
 
-// Common auth errors.
+// ======================================================================
+// Constants and Errors
+// ======================================================================
+
+const (
+	DefaultAccessTokenExpiry  = 15 * time.Minute
+	DefaultRefreshTokenExpiry = 7 * 24 * time.Hour
+	DefaultMaxFailedAttempts  = 5
+	DefaultLockoutDuration    = 15 * time.Minute
+	DefaultVerificationExpiry = 24 * time.Hour
+	DefaultResetExpiry        = 1 * time.Hour
+)
+
 var (
 	ErrInvalidCredentials      = errors.New("invalid credentials")
 	ErrUserNotFound            = errors.New("user not found")
@@ -36,56 +51,84 @@ var (
 	ErrAccountLocked           = errors.New("account is temporarily locked due to too many failed attempts")
 	ErrEmailNotSent            = errors.New("failed to send email")
 	ErrSessionNotFound         = errors.New("session not found")
+	ErrInvalidRefreshToken     = errors.New("invalid refresh token")
+	ErrRefreshTokenExpired     = errors.New("refresh token has expired")
+	ErrRegistrationDisabled    = errors.New("registration is currently disabled")
+	ErrVerificationRequired    = errors.New("email verification is required")
+	ErrPasswordTooWeak         = errors.New("password does not meet security requirements")
+	ErrDuplicateEmail          = errors.New("email already registered")
+	ErrDuplicateUsername       = errors.New("username already taken")
 )
+
+// ======================================================================
+// AuthService Interface
+// ======================================================================
 
 // AuthService defines the authentication service interface.
 type AuthService interface {
-	// Registration
+	// Register registers a new user.
 	Register(ctx context.Context, req *dto.RegisterRequest) (*dto.AuthResponse, error)
 	
-	// Login
+	// Login authenticates a user.
 	Login(ctx context.Context, req *dto.LoginRequest) (*dto.AuthResponse, error)
 	
-	// Refresh token
+	// RefreshToken refreshes the access token.
 	RefreshToken(ctx context.Context, refreshToken string) (*dto.AuthResponse, error)
 	
-	// Logout
+	// Logout invalidates a refresh token.
 	Logout(ctx context.Context, refreshToken string) error
 	
-	// Email verification
+	// SendVerificationEmail sends an email verification link.
 	SendVerificationEmail(ctx context.Context, userID string) error
+	
+	// VerifyEmail verifies the email using a token.
 	VerifyEmail(ctx context.Context, token string) error
 	
-	// Password reset
+	// RequestPasswordReset sends a password reset email.
 	RequestPasswordReset(ctx context.Context, email string) error
+	
+	// ResetPassword resets the password using a token.
 	ResetPassword(ctx context.Context, token, newPassword string) error
 	
-	// Change password (authenticated)
+	// ChangePassword changes a user's password (authenticated).
 	ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error
 	
-	// Session management
+	// GetActiveSessions returns all active sessions for a user.
 	GetActiveSessions(ctx context.Context, userID string) ([]*interfaces.Session, error)
+	
+	// RevokeSession revokes a specific session.
 	RevokeSession(ctx context.Context, sessionID string) error
+	
+	// RevokeAllSessions revokes all sessions for a user.
 	RevokeAllSessions(ctx context.Context, userID string) error
 	
-	// Account lockout
+	// IsAccountLocked checks if a user account is temporarily locked.
 	IsAccountLocked(ctx context.Context, userID string) (bool, error)
+	
+	// ResetFailedAttempts resets the failed login counter.
 	ResetFailedAttempts(ctx context.Context, userID string) error
 }
 
+// ======================================================================
+// authService Implementation
+// ======================================================================
+
 // authService implements AuthService.
 type authService struct {
-	userRepo        interfaces.UserRepository
-	sessionRepo     interfaces.SessionRepository
-	notificationRepo interfaces.NotificationRepository
-	emailAdapter    adapter.EmailAdapter
-	redisAdapter    adapter.RedisAdapter
-	jwtSecret       string
-	jwtExpiry       time.Duration
-	refreshExpiry   time.Duration
+	userRepo          interfaces.UserRepository
+	sessionRepo       interfaces.SessionRepository
+	notificationRepo  interfaces.NotificationRepository
+	emailAdapter      adapter.EmailAdapter
+	redisAdapter      adapter.RedisAdapter
+	jwtSecret         string
+	jwtIssuer         string
+	jwtAudience       string
+	accessExpiry      time.Duration
+	refreshExpiry     time.Duration
 	maxFailedAttempts int
 	lockoutDuration   time.Duration
-	log             *logrus.Entry
+	frontendBaseURL   string
+	log               *logrus.Entry
 }
 
 // NewAuthService creates a new auth service.
@@ -96,28 +139,49 @@ func NewAuthService(
 	emailAdapter adapter.EmailAdapter,
 	redisAdapter adapter.RedisAdapter,
 	jwtSecret string,
-	jwtExpiry time.Duration,
+	jwtIssuer string,
+	jwtAudience string,
+	accessExpiry time.Duration,
 	refreshExpiry time.Duration,
 	maxFailedAttempts int,
 	lockoutDuration time.Duration,
+	frontendBaseURL string,
 ) AuthService {
+	if maxFailedAttempts == 0 {
+		maxFailedAttempts = DefaultMaxFailedAttempts
+	}
+	if lockoutDuration == 0 {
+		lockoutDuration = DefaultLockoutDuration
+	}
 	return &authService{
-		userRepo:         userRepo,
-		sessionRepo:      sessionRepo,
-		notificationRepo: notificationRepo,
-		emailAdapter:     emailAdapter,
-		redisAdapter:     redisAdapter,
-		jwtSecret:        jwtSecret,
-		jwtExpiry:        jwtExpiry,
-		refreshExpiry:    refreshExpiry,
+		userRepo:          userRepo,
+		sessionRepo:       sessionRepo,
+		notificationRepo:  notificationRepo,
+		emailAdapter:      emailAdapter,
+		redisAdapter:      redisAdapter,
+		jwtSecret:         jwtSecret,
+		jwtIssuer:         jwtIssuer,
+		jwtAudience:       jwtAudience,
+		accessExpiry:      accessExpiry,
+		refreshExpiry:     refreshExpiry,
 		maxFailedAttempts: maxFailedAttempts,
 		lockoutDuration:   lockoutDuration,
-		log:              logger.WithField("service", "auth"),
+		frontendBaseURL:   frontendBaseURL,
+		log:               logger.WithField("service", "auth"),
 	}
 }
 
+// ======================================================================
+// Register
+// ======================================================================
+
 // Register registers a new user.
 func (s *authService) Register(ctx context.Context, req *dto.RegisterRequest) (*dto.AuthResponse, error) {
+	// Validate request
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	req.Sanitize()
 	// Validate email
 	email, err := valueobjects.NewEmail(req.Email)
 	if err != nil {
@@ -134,7 +198,7 @@ func (s *authService) Register(ctx context.Context, req *dto.RegisterRequest) (*
 		return nil, fmt.Errorf("failed to check email: %w", err)
 	}
 	if exists {
-		return nil, interfaces.ErrDuplicateEmail
+		return nil, ErrDuplicateEmail
 	}
 	// Check if username already exists
 	exists, err = s.userRepo.ExistsByUsername(ctx, username.String())
@@ -142,22 +206,32 @@ func (s *authService) Register(ctx context.Context, req *dto.RegisterRequest) (*
 		return nil, fmt.Errorf("failed to check username: %w", err)
 	}
 	if exists {
-		return nil, interfaces.ErrDuplicateUsername
+		return nil, ErrDuplicateUsername
 	}
 	// Create user entity
 	user, err := entities.NewUser(username.String(), email.String(), req.Password, req.FullName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
-	// If verification is required, set not verified (default is false)
+	// Set bio if provided
+	if req.Bio != "" {
+		if len(req.Bio) > 160 {
+			return nil, ErrBioTooLong
+		}
+		user.Bio = req.Bio
+	}
+	// Set avatar if provided
+	if req.AvatarURL != "" && isValidURL(req.AvatarURL) {
+		user.AvatarURL = req.AvatarURL
+	}
 	// Save user
 	if err := s.userRepo.Create(ctx, user); err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
-	// Send verification email (if configured)
+	// Send verification email if requested
 	if req.SendVerificationEmail {
 		if err := s.SendVerificationEmail(ctx, user.ID); err != nil {
-			s.log.WithError(err).WithField("user_id", user.ID).Warn("failed to send verification email")
+			s.log.WithError(err).WithField("user_id", user.ID).Warn("Failed to send verification email")
 		}
 	}
 	// Generate tokens
@@ -167,12 +241,14 @@ func (s *authService) Register(ctx context.Context, req *dto.RegisterRequest) (*
 	}
 	// Store session
 	session := &interfaces.Session{
+		ID:           uuid.New().String(),
 		UserID:       user.ID,
 		RefreshToken: refreshToken,
 		UserAgent:    req.UserAgent,
 		IP:           req.IP,
 		ExpiresAt:    time.Now().Add(s.refreshExpiry),
 		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
@@ -182,18 +258,42 @@ func (s *authService) Register(ctx context.Context, req *dto.RegisterRequest) (*
 		"user_id":   user.ID,
 		"username":  user.Username,
 		"email":     user.Email,
-	}).Info("user registered successfully")
+		"ip":        req.IP,
+		"user_agent": req.UserAgent,
+	}).Info("User registered successfully")
+	// Build response
+	userResp := dto.NewUserResponse().
+		WithID(user.ID).
+		WithUsername(user.Username).
+		WithEmail(user.Email).
+		WithFullName(user.FullName).
+		WithBio(user.Bio).
+		WithAvatarURL(user.AvatarURL).
+		WithRole(user.Role).
+		WithStatus(user.Status).
+		WithVerified(user.IsVerified).
+		WithPrivate(user.IsPrivate).
+		WithJoinedAt(user.CreatedAt)
 	return &dto.AuthResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		TokenType:    "Bearer",
-		ExpiresIn:    int64(s.jwtExpiry.Seconds()),
-		User:         user.ToPublic(),
+		ExpiresIn:    int64(s.accessExpiry.Seconds()),
+		User:         userResp,
 	}, nil
 }
 
+// ======================================================================
+// Login
+// ======================================================================
+
 // Login authenticates a user.
 func (s *authService) Login(ctx context.Context, req *dto.LoginRequest) (*dto.AuthResponse, error) {
+	// Validate request
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	req.Sanitize()
 	// Find user by email or username
 	user, err := s.userRepo.GetByUsernameOrEmail(ctx, req.Identifier)
 	if err != nil {
@@ -217,17 +317,17 @@ func (s *authService) Login(ctx context.Context, req *dto.LoginRequest) (*dto.Au
 		return nil, ErrInvalidCredentials
 	}
 	// Check account status
-	if user.IsSuspended {
+	if user.IsSuspended() {
 		return nil, ErrUserSuspended
 	}
-	if !user.IsActive {
+	if user.IsInactive() {
 		return nil, ErrUserInactive
 	}
 	// Reset failed attempts on success
 	_ = s.ResetFailedAttempts(ctx, user.ID)
 	// Update last active
 	if err := s.userRepo.UpdateLastActive(ctx, user.ID); err != nil {
-		s.log.WithError(err).Warn("failed to update last active")
+		s.log.WithError(err).Warn("Failed to update last active")
 	}
 	// Generate tokens
 	accessToken, refreshToken, err := s.generateTokens(user.ID, user.Username, user.Role)
@@ -236,30 +336,50 @@ func (s *authService) Login(ctx context.Context, req *dto.LoginRequest) (*dto.Au
 	}
 	// Store session
 	session := &interfaces.Session{
+		ID:           uuid.New().String(),
 		UserID:       user.ID,
 		RefreshToken: refreshToken,
 		UserAgent:    req.UserAgent,
 		IP:           req.IP,
 		ExpiresAt:    time.Now().Add(s.refreshExpiry),
 		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 	// Log
 	s.log.WithFields(logrus.Fields{
-		"user_id":  user.ID,
-		"username": user.Username,
-		"ip":       req.IP,
-	}).Info("user logged in")
+		"user_id":   user.ID,
+		"username":  user.Username,
+		"ip":        req.IP,
+		"user_agent": req.UserAgent,
+	}).Info("User logged in")
+	// Build response
+	userResp := dto.NewUserResponse().
+		WithID(user.ID).
+		WithUsername(user.Username).
+		WithEmail(user.Email).
+		WithFullName(user.FullName).
+		WithBio(user.Bio).
+		WithAvatarURL(user.AvatarURL).
+		WithRole(user.Role).
+		WithStatus(user.Status).
+		WithVerified(user.IsVerified).
+		WithPrivate(user.IsPrivate).
+		WithJoinedAt(user.CreatedAt)
 	return &dto.AuthResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		TokenType:    "Bearer",
-		ExpiresIn:    int64(s.jwtExpiry.Seconds()),
-		User:         user.ToPublic(),
+		ExpiresIn:    int64(s.accessExpiry.Seconds()),
+		User:         userResp,
 	}, nil
 }
+
+// ======================================================================
+// Refresh Token
+// ======================================================================
 
 // RefreshToken refreshes the access token using a refresh token.
 func (s *authService) RefreshToken(ctx context.Context, refreshToken string) (*dto.AuthResponse, error) {
@@ -284,10 +404,10 @@ func (s *authService) RefreshToken(ctx context.Context, refreshToken string) (*d
 		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
 	// Check status
-	if user.IsSuspended {
+	if user.IsSuspended() {
 		return nil, ErrUserSuspended
 	}
-	if !user.IsActive {
+	if user.IsInactive() {
 		return nil, ErrUserInactive
 	}
 	// Generate new tokens (rotate)
@@ -298,21 +418,38 @@ func (s *authService) RefreshToken(ctx context.Context, refreshToken string) (*d
 	// Update session with new refresh token
 	session.RefreshToken = newRefresh
 	session.ExpiresAt = time.Now().Add(s.refreshExpiry)
+	session.UpdatedAt = time.Now()
 	if err := s.sessionRepo.Update(ctx, session); err != nil {
 		return nil, fmt.Errorf("failed to update session: %w", err)
 	}
 	// Delete old refresh token from Redis if stored (optional)
 	// ...
-
-	s.log.WithField("user_id", user.ID).Debug("refresh token rotated")
+	s.log.WithField("user_id", user.ID).Debug("Refresh token rotated")
+	// Build response
+	userResp := dto.NewUserResponse().
+		WithID(user.ID).
+		WithUsername(user.Username).
+		WithEmail(user.Email).
+		WithFullName(user.FullName).
+		WithBio(user.Bio).
+		WithAvatarURL(user.AvatarURL).
+		WithRole(user.Role).
+		WithStatus(user.Status).
+		WithVerified(user.IsVerified).
+		WithPrivate(user.IsPrivate).
+		WithJoinedAt(user.CreatedAt)
 	return &dto.AuthResponse{
 		AccessToken:  newAccess,
 		RefreshToken: newRefresh,
 		TokenType:    "Bearer",
-		ExpiresIn:    int64(s.jwtExpiry.Seconds()),
-		User:         user.ToPublic(),
+		ExpiresIn:    int64(s.accessExpiry.Seconds()),
+		User:         userResp,
 	}, nil
 }
+
+// ======================================================================
+// Logout
+// ======================================================================
 
 // Logout invalidates a refresh token.
 func (s *authService) Logout(ctx context.Context, refreshToken string) error {
@@ -327,9 +464,13 @@ func (s *authService) Logout(ctx context.Context, refreshToken string) error {
 	if err := s.sessionRepo.Delete(ctx, session.ID); err != nil {
 		return fmt.Errorf("failed to delete session: %w", err)
 	}
-	s.log.WithField("user_id", session.UserID).Info("user logged out")
+	s.log.WithField("user_id", session.UserID).Info("User logged out")
 	return nil
 }
+
+// ======================================================================
+// Email Verification
+// ======================================================================
 
 // SendVerificationEmail sends an email verification link.
 func (s *authService) SendVerificationEmail(ctx context.Context, userID string) error {
@@ -340,27 +481,33 @@ func (s *authService) SendVerificationEmail(ctx context.Context, userID string) 
 	if user.IsVerified {
 		return ErrEmailAlreadyVerified
 	}
-	// Generate verification token (JWT or random)
+	// Generate verification token (JWT)
 	token, err := s.generateVerificationToken(user.ID, user.Email)
 	if err != nil {
 		return fmt.Errorf("failed to generate verification token: %w", err)
 	}
-	// Send email (async)
+	// Send email
 	verificationLink := fmt.Sprintf("%s/verify-email?token=%s", s.frontendBaseURL, token)
 	msg := &adapter.EmailMessage{
 		To:      []string{user.Email},
 		Subject: "Verify your email address",
 		HTMLBody: fmt.Sprintf(`
-			<h1>Welcome %s!</h1>
-			<p>Please verify your email by clicking the link below:</p>
-			<a href="%s">%s</a>
-			<p>This link expires in 24 hours.</p>
-		`, user.FullName, verificationLink, verificationLink),
+			<html>
+			<body>
+				<h1>Welcome %s!</h1>
+				<p>Please verify your email by clicking the link below:</p>
+				<a href="%s" style="background-color: #1DA1F2; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Verify Email</a>
+				<p>This link expires in 24 hours.</p>
+				<p>If you didn't create an account, please ignore this email.</p>
+			</body>
+			</html>
+		`, user.FullName, verificationLink),
 		TextBody: fmt.Sprintf("Verify your email: %s", verificationLink),
 	}
 	if err := s.emailAdapter.Queue(ctx, msg); err != nil {
 		return fmt.Errorf("failed to queue verification email: %w", err)
 	}
+	s.log.WithField("user_id", userID).Info("Verification email sent")
 	return nil
 }
 
@@ -378,18 +525,24 @@ func (s *authService) VerifyEmail(ctx context.Context, token string) error {
 	if user.IsVerified {
 		return ErrEmailAlreadyVerified
 	}
-	// Ensure email matches (optional)
+	// Ensure email matches
 	if user.Email != email {
 		return ErrInvalidToken
 	}
 	// Update user
-	user.IsVerified = true
+	if err := user.Verify(); err != nil {
+		return err
+	}
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return fmt.Errorf("failed to update user verification: %w", err)
 	}
-	s.log.WithField("user_id", userID).Info("email verified")
+	s.log.WithField("user_id", userID).Info("Email verified")
 	return nil
 }
+
+// ======================================================================
+// Password Reset
+// ======================================================================
 
 // RequestPasswordReset sends a password reset email.
 func (s *authService) RequestPasswordReset(ctx context.Context, email string) error {
@@ -410,7 +563,7 @@ func (s *authService) RequestPasswordReset(ctx context.Context, email string) er
 	if err != nil {
 		return fmt.Errorf("failed to generate reset token: %w", err)
 	}
-	// Store token in Redis with expiry (e.g., 1 hour)
+	// Store token in Redis with expiry
 	key := "password_reset:" + token
 	if err := s.redisAdapter.Set(ctx, key, user.ID, 1*time.Hour); err != nil {
 		return fmt.Errorf("failed to store reset token: %w", err)
@@ -421,17 +574,22 @@ func (s *authService) RequestPasswordReset(ctx context.Context, email string) er
 		To:      []string{user.Email},
 		Subject: "Reset your password",
 		HTMLBody: fmt.Sprintf(`
-			<h1>Password Reset</h1>
-			<p>You requested to reset your password. Click the link below:</p>
-			<a href="%s">%s</a>
-			<p>This link expires in 1 hour.</p>
-			<p>If you didn't request this, ignore this email.</p>
-		`, resetLink, resetLink),
+			<html>
+			<body>
+				<h1>Password Reset</h1>
+				<p>You requested to reset your password. Click the link below:</p>
+				<a href="%s" style="background-color: #1DA1F2; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Reset Password</a>
+				<p>This link expires in 1 hour.</p>
+				<p>If you didn't request this, please ignore this email.</p>
+			</body>
+			</html>
+		`, resetLink),
 		TextBody: fmt.Sprintf("Reset your password: %s", resetLink),
 	}
 	if err := s.emailAdapter.Queue(ctx, msg); err != nil {
 		return fmt.Errorf("failed to queue reset email: %w", err)
 	}
+	s.log.WithField("user_id", user.ID).Info("Password reset email sent")
 	return nil
 }
 
@@ -457,15 +615,19 @@ func (s *authService) ResetPassword(ctx context.Context, token, newPassword stri
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 	// Change password
-	if err := user.ChangePassword(newPassword); err != nil {
+	if err := user.SetPassword(newPassword); err != nil {
 		return err
 	}
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return fmt.Errorf("failed to update password: %w", err)
 	}
-	s.log.WithField("user_id", user.ID).Info("password reset successfully")
+	s.log.WithField("user_id", user.ID).Info("Password reset successfully")
 	return nil
 }
+
+// ======================================================================
+// Change Password (Authenticated)
+// ======================================================================
 
 // ChangePassword changes a user's password (authenticated).
 func (s *authService) ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error {
@@ -476,45 +638,65 @@ func (s *authService) ChangePassword(ctx context.Context, userID, oldPassword, n
 	if !user.CheckPassword(oldPassword) {
 		return ErrInvalidCredentials
 	}
-	if err := user.ChangePassword(newPassword); err != nil {
+	if err := user.SetPassword(newPassword); err != nil {
 		return err
 	}
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return fmt.Errorf("failed to update password: %w", err)
 	}
-	s.log.WithField("user_id", userID).Info("password changed")
+	// Invalidate all sessions after password change
+	_ = s.RevokeAllSessions(ctx, userID)
+	s.log.WithField("user_id", userID).Info("Password changed")
 	return nil
 }
 
+// ======================================================================
+// Session Management
+// ======================================================================
+
 // GetActiveSessions returns all active sessions for a user.
 func (s *authService) GetActiveSessions(ctx context.Context, userID string) ([]*interfaces.Session, error) {
-	return s.sessionRepo.GetByUserID(ctx, userID)
+	sessions, err := s.sessionRepo.GetByUserID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sessions: %w", err)
+	}
+	active := make([]*interfaces.Session, 0)
+	for _, sess := range sessions {
+		if sess.ExpiresAt.After(time.Now()) {
+			active = append(active, sess)
+		}
+	}
+	return active, nil
 }
 
 // RevokeSession revokes a specific session.
 func (s *authService) RevokeSession(ctx context.Context, sessionID string) error {
-	session, err := s.sessionRepo.GetByID(ctx, sessionID)
-	if err != nil {
-		return err
+	if err := s.sessionRepo.Delete(ctx, sessionID); err != nil {
+		if errors.Is(err, interfaces.ErrSessionNotFound) {
+			return ErrSessionNotFound
+		}
+		return fmt.Errorf("failed to revoke session: %w", err)
 	}
-	if session.UserID != "" { // ensure user owns session? we'll validate in handler
-	}
-	return s.sessionRepo.Delete(ctx, sessionID)
+	return nil
 }
 
 // RevokeAllSessions revokes all sessions for a user.
 func (s *authService) RevokeAllSessions(ctx context.Context, userID string) error {
 	sessions, err := s.sessionRepo.GetByUserID(ctx, userID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get sessions: %w", err)
 	}
 	for _, sess := range sessions {
 		if err := s.sessionRepo.Delete(ctx, sess.ID); err != nil {
-			s.log.WithError(err).WithField("session_id", sess.ID).Warn("failed to delete session")
+			s.log.WithError(err).WithField("session_id", sess.ID).Warn("Failed to delete session")
 		}
 	}
 	return nil
 }
+
+// ======================================================================
+// Account Lockout
+// ======================================================================
 
 // IsAccountLocked checks if a user account is temporarily locked.
 func (s *authService) IsAccountLocked(ctx context.Context, userID string) (bool, error) {
@@ -526,7 +708,7 @@ func (s *authService) IsAccountLocked(ctx context.Context, userID string) (bool,
 		}
 		return false, fmt.Errorf("failed to get failed attempts: %w", err)
 	}
-	count := 0
+	var count int
 	fmt.Sscanf(countStr, "%d", &count)
 	return count >= s.maxFailedAttempts, nil
 }
@@ -556,24 +738,30 @@ func (s *authService) recordFailedAttempt(ctx context.Context, userID string) er
 	return nil
 }
 
-// --- Token generation helpers ---
+// ======================================================================
+// Token Generation Helpers
+// ======================================================================
 
 // generateTokens creates access and refresh tokens.
-func (s *authService) generateTokens(userID, username string, role entities.UserRole) (string, string, error) {
+func (s *authService) generateTokens(userID, username, role string) (string, string, error) {
 	// Access token
-	accessClaims := jwt.MapClaims{
-		"sub":  userID,
-		"user": username,
-		"role": string(role),
-		"exp":  time.Now().Add(s.jwtExpiry).Unix(),
-		"iat":  time.Now().Unix(),
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"sub":      userID,
+		"user":     username,
+		"role":     role,
+		"iss":      s.jwtIssuer,
+		"aud":      s.jwtAudience,
+		"exp":      now.Add(s.accessExpiry).Unix(),
+		"iat":      now.Unix(),
+		"nbf":      now.Unix(),
+		"token_type": "access",
 	}
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	accessString, err := accessToken.SignedString([]byte(s.jwtSecret))
 	if err != nil {
 		return "", "", err
 	}
-
 	// Refresh token (opaque, random bytes)
 	refreshBytes := make([]byte, 32)
 	if _, err := rand.Read(refreshBytes); err != nil {
@@ -585,12 +773,14 @@ func (s *authService) generateTokens(userID, username string, role entities.User
 
 // generateVerificationToken creates a JWT for email verification.
 func (s *authService) generateVerificationToken(userID, email string) (string, error) {
+	now := time.Now()
 	claims := jwt.MapClaims{
-		"sub":   userID,
-		"email": email,
-		"exp":   time.Now().Add(24 * time.Hour).Unix(),
-		"iat":   time.Now().Unix(),
-		"type":  "verification",
+		"sub":      userID,
+		"email":    email,
+		"exp":      now.Add(DefaultVerificationExpiry).Unix(),
+		"iat":      now.Unix(),
+		"nbf":      now.Unix(),
+		"token_type": "verification",
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.jwtSecret))
@@ -611,7 +801,7 @@ func (s *authService) parseVerificationToken(tokenString string) (userID, email 
 	if !ok || !token.Valid {
 		return "", "", ErrInvalidToken
 	}
-	if claims["type"] != "verification" {
+	if claims["token_type"] != "verification" {
 		return "", "", ErrInvalidToken
 	}
 	userID, ok = claims["sub"].(string)
@@ -634,14 +824,58 @@ func (s *authService) generateResetToken(userID, email string) (string, error) {
 	return base64.URLEncoding.EncodeToString(bytes), nil
 }
 
-// set frontendBaseURL (assigned from config)
-var frontendBaseURL string
+// ======================================================================
+// Helper Functions
+// ======================================================================
 
-// SetFrontendBaseURL sets the base URL for frontend links.
-func SetFrontendBaseURL(url string) {
-	frontendBaseURL = url
+// isValidURL checks if a URL is valid.
+func isValidURL(url string) bool {
+	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
 }
 
-// --- DTOs ---
+// ======================================================================
+// Global Instance
+// ======================================================================
 
-// (These are already defined in dto package, but we include references)
+var defaultAuthService AuthService
+
+// InitAuthService initializes the global auth service.
+func InitAuthService(
+	userRepo interfaces.UserRepository,
+	sessionRepo interfaces.SessionRepository,
+	notificationRepo interfaces.NotificationRepository,
+	emailAdapter adapter.EmailAdapter,
+	redisAdapter adapter.RedisAdapter,
+	jwtSecret string,
+	jwtIssuer string,
+	jwtAudience string,
+	accessExpiry time.Duration,
+	refreshExpiry time.Duration,
+	maxFailedAttempts int,
+	lockoutDuration time.Duration,
+	frontendBaseURL string,
+) {
+	defaultAuthService = NewAuthService(
+		userRepo,
+		sessionRepo,
+		notificationRepo,
+		emailAdapter,
+		redisAdapter,
+		jwtSecret,
+		jwtIssuer,
+		jwtAudience,
+		accessExpiry,
+		refreshExpiry,
+		maxFailedAttempts,
+		lockoutDuration,
+		frontendBaseURL,
+	)
+}
+
+// GetAuthService returns the global auth service.
+func GetAuthService() AuthService {
+	if defaultAuthService == nil {
+		panic("auth service not initialized")
+	}
+	return defaultAuthService
+}
