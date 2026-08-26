@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,17 +25,21 @@ import (
 const (
 	MaxNotificationsLimit = 100
 	DefaultNotificationsLimit = 20
+	MaxGroupLimit         = 50
+	DefaultGroupLimit     = 10
 )
 
 var (
-	ErrNotificationNotFound = errors.New("notification not found")
-	ErrNotificationAlreadyRead = errors.New("notification already read")
-	ErrInvalidNotificationType = errors.New("invalid notification type")
-	ErrNotificationUserMismatch = errors.New("notification does not belong to user")
+	ErrNotificationNotFound      = errors.New("notification not found")
+	ErrNotificationAlreadyRead   = errors.New("notification already read")
+	ErrInvalidNotificationType   = errors.New("invalid notification type")
+	ErrNotificationUserMismatch  = errors.New("notification does not belong to user")
+	ErrNotificationLimitExceeded = errors.New("notification limit exceeded")
+	ErrUserNotFound              = errors.New("user not found")
 )
 
 // ======================================================================
-= NotificationService Interface
+// NotificationService Interface
 // ======================================================================
 
 // NotificationService defines the notification service interface.
@@ -80,7 +85,7 @@ type NotificationService interface {
 }
 
 // ======================================================================
-= NotificationService Implementation
+// notificationService Implementation
 // ======================================================================
 
 // notificationService implements NotificationService.
@@ -112,31 +117,34 @@ func NewNotificationService(
 // Create Notification
 // ======================================================================
 
-// Create creates a new notification.
 func (s *notificationService) Create(ctx context.Context, notification *entities.Notification) error {
 	// Validate notification type
 	validTypes := map[string]bool{
 		"like": true, "retweet": true, "follow": true, "reply": true,
-		"mention": true, "quote": true, "message": true,
+		"mention": true, "quote": true, "message": true, "join": true,
+		"leave": true, "community": true, "system": true,
 	}
 	if !validTypes[notification.Type] {
 		return ErrInvalidNotificationType
 	}
-	
 	// Check if user exists
 	_, err := s.userRepo.GetByID(ctx, notification.UserID)
 	if err != nil {
+		if errors.Is(err, interfaces.ErrUserNotFound) {
+			return ErrUserNotFound
+		}
 		return fmt.Errorf("failed to get user: %w", err)
 	}
-	
 	// If from_user_id is provided, verify exists
 	if notification.FromUserID != "" {
 		_, err := s.userRepo.GetByID(ctx, notification.FromUserID)
 		if err != nil {
+			if errors.Is(err, interfaces.ErrUserNotFound) {
+				return ErrUserNotFound
+			}
 			return fmt.Errorf("failed to get from user: %w", err)
 		}
 	}
-	
 	// Generate ID if not set
 	if notification.ID == "" {
 		notification.ID = uuid.New().String()
@@ -144,28 +152,24 @@ func (s *notificationService) Create(ctx context.Context, notification *entities
 	if notification.CreatedAt.IsZero() {
 		notification.CreatedAt = time.Now()
 	}
-	
 	// Save notification
 	if err := s.notificationRepo.Create(ctx, notification); err != nil {
 		return fmt.Errorf("failed to create notification: %w", err)
 	}
-	
 	// Invalidate unread count cache
 	_ = s.invalidateUnreadCache(ctx, notification.UserID)
 	_ = s.invalidateListCache(ctx, notification.UserID)
-	
+	_ = s.invalidateGroupedCache(ctx, notification.UserID)
 	// Send real-time notification via WebSocket
 	if s.wsHub != nil {
 		s.wsHub.SendNotification(notification.UserID, notification)
 	}
-	
 	s.log.WithFields(logrus.Fields{
 		"user_id":     notification.UserID,
 		"from_user_id": notification.FromUserID,
 		"type":        notification.Type,
 		"reference_id": notification.ReferenceID,
 	}).Info("Notification created")
-	
 	return nil
 }
 
@@ -194,35 +198,29 @@ func (s *notificationService) GetByUserID(ctx context.Context, userID, cursor st
 	if limit < 1 || limit > MaxNotificationsLimit {
 		limit = DefaultNotificationsLimit
 	}
-	
 	// Check cache for first page
-	if cursor == "" {
+	if cursor == "" && s.redisAdapter != nil {
 		cacheKey := fmt.Sprintf("notifications:%s:%d", userID, limit)
-		if s.redisAdapter != nil {
-			var cached struct {
-				Notifications []*entities.Notification `json:"notifications"`
-				NextCursor    string                    `json:"next_cursor"`
-				Total         int64                     `json:"total"`
-			}
-			if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
-				s.log.WithField("user_id", userID).Debug("Notifications served from cache")
-				return cached.Notifications, cached.NextCursor, cached.Total, nil
-			}
+		var cached struct {
+			Notifications []*entities.Notification `json:"notifications"`
+			NextCursor    string                    `json:"next_cursor"`
+			Total         int64                     `json:"total"`
+		}
+		if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
+			s.log.WithField("user_id", userID).Debug("Notifications served from cache")
+			return cached.Notifications, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Get from repository
 	notifications, nextCursor, err := s.notificationRepo.GetByUserID(ctx, userID, cursor, limit)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to get notifications: %w", err)
 	}
-	
 	// Get total count
 	total, err := s.notificationRepo.CountByUserID(ctx, userID)
 	if err != nil {
 		total = int64(len(notifications))
 	}
-	
 	// Cache first page for 30 seconds
 	if cursor == "" && s.redisAdapter != nil {
 		cacheData := struct {
@@ -237,7 +235,6 @@ func (s *notificationService) GetByUserID(ctx context.Context, userID, cursor st
 		cacheKey := fmt.Sprintf("notifications:%s:%d", userID, limit)
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 30*time.Second)
 	}
-	
 	return notifications, nextCursor, total, nil
 }
 
@@ -250,35 +247,29 @@ func (s *notificationService) GetUnreadByUserID(ctx context.Context, userID, cur
 	if limit < 1 || limit > MaxNotificationsLimit {
 		limit = DefaultNotificationsLimit
 	}
-	
 	// Check cache for first page
-	if cursor == "" {
+	if cursor == "" && s.redisAdapter != nil {
 		cacheKey := fmt.Sprintf("unread_notifications:%s:%d", userID, limit)
-		if s.redisAdapter != nil {
-			var cached struct {
-				Notifications []*entities.Notification `json:"notifications"`
-				NextCursor    string                    `json:"next_cursor"`
-				Total         int64                     `json:"total"`
-			}
-			if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
-				return cached.Notifications, cached.NextCursor, cached.Total, nil
-			}
+		var cached struct {
+			Notifications []*entities.Notification `json:"notifications"`
+			NextCursor    string                    `json:"next_cursor"`
+			Total         int64                     `json:"total"`
+		}
+		if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
+			return cached.Notifications, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Get from repository
 	notifications, nextCursor, err := s.notificationRepo.GetUnreadByUserID(ctx, userID, cursor, limit)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to get unread notifications: %w", err)
 	}
-	
 	// Get total count
 	total, err := s.notificationRepo.CountUnread(ctx, userID)
 	if err != nil {
 		total = int64(len(notifications))
 	}
-	
-	// Cache first page for 15 seconds (more frequent updates)
+	// Cache first page for 15 seconds
 	if cursor == "" && s.redisAdapter != nil {
 		cacheData := struct {
 			Notifications []*entities.Notification `json:"notifications"`
@@ -292,12 +283,11 @@ func (s *notificationService) GetUnreadByUserID(ctx context.Context, userID, cur
 		cacheKey := fmt.Sprintf("unread_notifications:%s:%d", userID, limit)
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 15*time.Second)
 	}
-	
 	return notifications, nextCursor, total, nil
 }
 
 // ======================================================================
-= Mark as Read
+// Mark as Read
 // ======================================================================
 
 // MarkAsRead marks a notification as read.
@@ -310,32 +300,35 @@ func (s *notificationService) MarkAsRead(ctx context.Context, userID, notificati
 		}
 		return fmt.Errorf("failed to get notification: %w", err)
 	}
-	
 	// Verify ownership
 	if notification.UserID != userID {
 		return ErrNotificationUserMismatch
 	}
-	
 	// Check if already read
 	if notification.Read {
 		return ErrNotificationAlreadyRead
 	}
-	
 	// Mark as read
 	if err := s.notificationRepo.MarkAsRead(ctx, notificationID); err != nil {
 		return fmt.Errorf("failed to mark notification as read: %w", err)
 	}
-	
 	// Invalidate caches
 	_ = s.invalidateUnreadCache(ctx, userID)
 	_ = s.invalidateListCache(ctx, userID)
 	_ = s.invalidateGroupedCache(ctx, userID)
-	
+	// Send WebSocket update
+	if s.wsHub != nil {
+		s.wsHub.BroadcastToUser(userID, map[string]interface{}{
+			"type":          "notification_read",
+			"notification_id": notificationID,
+			"timestamp":     time.Now().Unix(),
+		})
+	}
 	return nil
 }
 
 // ======================================================================
-= Mark All as Read
+// Mark All as Read
 // ======================================================================
 
 // MarkAllAsRead marks all notifications for a user as read.
@@ -343,18 +336,22 @@ func (s *notificationService) MarkAllAsRead(ctx context.Context, userID string) 
 	if err := s.notificationRepo.MarkAllAsRead(ctx, userID); err != nil {
 		return fmt.Errorf("failed to mark all as read: %w", err)
 	}
-	
 	// Invalidate caches
 	_ = s.invalidateUnreadCache(ctx, userID)
 	_ = s.invalidateListCache(ctx, userID)
 	_ = s.invalidateGroupedCache(ctx, userID)
-	
+	if s.wsHub != nil {
+		s.wsHub.BroadcastToUser(userID, map[string]interface{}{
+			"type":      "all_notifications_read",
+			"timestamp": time.Now().Unix(),
+		})
+	}
 	s.log.WithField("user_id", userID).Info("All notifications marked as read")
 	return nil
 }
 
 // ======================================================================
-= Mark Multiple as Read
+// Mark Multiple as Read
 // ======================================================================
 
 // MarkMultipleAsRead marks multiple notifications as read.
@@ -362,7 +359,6 @@ func (s *notificationService) MarkMultipleAsRead(ctx context.Context, userID str
 	if len(ids) == 0 {
 		return nil
 	}
-	
 	// Verify ownership for each notification
 	for _, id := range ids {
 		notification, err := s.notificationRepo.GetByID(ctx, id)
@@ -373,21 +369,18 @@ func (s *notificationService) MarkMultipleAsRead(ctx context.Context, userID str
 			return fmt.Errorf("notification %s does not belong to user", id)
 		}
 	}
-	
 	if err := s.notificationRepo.MarkMultipleAsRead(ctx, ids); err != nil {
 		return fmt.Errorf("failed to mark multiple as read: %w", err)
 	}
-	
 	// Invalidate caches
 	_ = s.invalidateUnreadCache(ctx, userID)
 	_ = s.invalidateListCache(ctx, userID)
 	_ = s.invalidateGroupedCache(ctx, userID)
-	
 	return nil
 }
 
 // ======================================================================
-= Get Unread Count
+// Get Unread Count
 // ======================================================================
 
 // GetUnreadCount returns the number of unread notifications for a user.
@@ -400,22 +393,19 @@ func (s *notificationService) GetUnreadCount(ctx context.Context, userID string)
 			return count, nil
 		}
 	}
-	
 	count, err := s.notificationRepo.CountUnread(ctx, userID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get unread count: %w", err)
 	}
-	
 	// Cache for 10 seconds
 	if s.redisAdapter != nil {
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, count, 10*time.Second)
 	}
-	
 	return count, nil
 }
 
 // ======================================================================
-= Delete
+// Delete
 // ======================================================================
 
 // Delete deletes a notification.
@@ -428,26 +418,22 @@ func (s *notificationService) Delete(ctx context.Context, userID, notificationID
 		}
 		return fmt.Errorf("failed to get notification: %w", err)
 	}
-	
 	// Verify ownership
 	if notification.UserID != userID {
 		return ErrNotificationUserMismatch
 	}
-	
 	if err := s.notificationRepo.Delete(ctx, notificationID); err != nil {
 		return fmt.Errorf("failed to delete notification: %w", err)
 	}
-	
 	// Invalidate caches
 	_ = s.invalidateUnreadCache(ctx, userID)
 	_ = s.invalidateListCache(ctx, userID)
 	_ = s.invalidateGroupedCache(ctx, userID)
-	
 	return nil
 }
 
 // ======================================================================
-= Delete All
+// Delete All
 // ======================================================================
 
 // DeleteAll deletes all notifications for a user.
@@ -455,87 +441,67 @@ func (s *notificationService) DeleteAll(ctx context.Context, userID string) erro
 	if err := s.notificationRepo.BulkDeleteByUserID(ctx, userID); err != nil {
 		return fmt.Errorf("failed to delete all notifications: %w", err)
 	}
-	
 	// Invalidate caches
 	_ = s.invalidateUnreadCache(ctx, userID)
 	_ = s.invalidateListCache(ctx, userID)
 	_ = s.invalidateGroupedCache(ctx, userID)
-	
 	s.log.WithField("user_id", userID).Info("All notifications deleted")
 	return nil
 }
 
 // ======================================================================
-= Get Grouped Notifications
+// Get Grouped Notifications
 // ======================================================================
 
 // GetGroupedNotifications returns grouped notifications for a user.
 func (s *notificationService) GetGroupedNotifications(ctx context.Context, userID, cursor string, limit int) ([]*dto.GroupedNotificationResponse, string, int64, error) {
-	if limit < 1 || limit > MaxNotificationsLimit {
-		limit = DefaultNotificationsLimit
+	if limit < 1 || limit > MaxGroupLimit {
+		limit = DefaultGroupLimit
 	}
-	
 	// Check cache for first page
-	if cursor == "" {
+	if cursor == "" && s.redisAdapter != nil {
 		cacheKey := fmt.Sprintf("grouped_notifications:%s:%d", userID, limit)
-		if s.redisAdapter != nil {
-			var cached struct {
-				Groups    []*dto.GroupedNotificationResponse `json:"groups"`
-				NextCursor string                            `json:"next_cursor"`
-				Total      int64                             `json:"total"`
-			}
-			if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
-				return cached.Groups, cached.NextCursor, cached.Total, nil
-			}
+		var cached struct {
+			Groups    []*dto.GroupedNotificationResponse `json:"groups"`
+			NextCursor string                            `json:"next_cursor"`
+			Total      int64                             `json:"total"`
+		}
+		if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
+			return cached.Groups, cached.NextCursor, cached.Total, nil
 		}
 	}
-	
 	// Get grouped notifications from repository
 	groups, err := s.notificationRepo.GroupNotifications(ctx, userID, limit)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("failed to get grouped notifications: %w", err)
 	}
-	
 	// Build response
 	responses := make([]*dto.GroupedNotificationResponse, 0, len(groups))
 	for _, group := range groups {
-		// Get count of notifications in this group
-		count, err := s.notificationRepo.CountByType(ctx, userID, group.Type)
-		if err != nil {
-			count = 1
-		}
-		
 		// Get from user info
-		fromUser, _ := s.userRepo.GetByID(ctx, group.FromUserID)
-		
-		responses = append(responses, &dto.GroupedNotificationResponse{
-			Type:        group.Type,
-			ReferenceID: group.ReferenceID,
-			Count:       count,
-			LatestAt:    group.CreatedAt,
-			FromUserID:  group.FromUserID,
-			FromUsername: func() string {
-				if fromUser != nil {
-					return fromUser.Username
-				}
-				return ""
-			}(),
-			FromAvatarURL: func() string {
-				if fromUser != nil {
-					return fromUser.AvatarURL
-				}
-				return ""
-			}(),
-			IsRead: group.Read,
-		})
+		fromUser, _ := s.userRepo.GetByID(ctx, group.FromUserIDs[0])
+		resp := &dto.GroupedNotificationResponse{
+			Type:         group.Type,
+			ReferenceID:  group.ReferenceID,
+			Count:        group.Count,
+			LatestAt:     group.LatestAt,
+			FromUserIDs:  group.FromUserIDs,
+			ReadCount:    group.ReadCount,
+			UnreadCount:  group.UnreadCount,
+			LatestID:     group.LatestID,
+			IsRead:       group.ReadCount > 0 && group.UnreadCount == 0,
+		}
+		if fromUser != nil {
+			resp.FromUsername = fromUser.Username
+			resp.FromAvatarURL = fromUser.AvatarURL
+		}
+		responses = append(responses, resp)
 	}
-	
 	// Get total count
 	total, err := s.notificationRepo.CountByUserID(ctx, userID)
 	if err != nil {
 		total = int64(len(responses))
 	}
-	
 	// Cache for 30 seconds
 	if cursor == "" && s.redisAdapter != nil && len(responses) > 0 {
 		cacheData := struct {
@@ -550,82 +516,98 @@ func (s *notificationService) GetGroupedNotifications(ctx context.Context, userI
 		cacheKey := fmt.Sprintf("grouped_notifications:%s:%d", userID, limit)
 		_ = s.redisAdapter.CacheSet(ctx, cacheKey, cacheData, 30*time.Second)
 	}
-	
 	return responses, "", total, nil
 }
 
 // ======================================================================
-= Get Notification Stats
+= Stats and Analytics
 // ======================================================================
 
 // GetNotificationStats returns notification statistics.
 func (s *notificationService) GetNotificationStats(ctx context.Context) (*dto.NotificationStatsResponse, error) {
+	// Try cache
+	cacheKey := "notification_stats"
+	if s.redisAdapter != nil {
+		var cached dto.NotificationStatsResponse
+		if err := s.redisAdapter.GetJSON(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
+	}
 	stats, err := s.notificationRepo.GetNotificationStats(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get notification stats: %w", err)
 	}
-	
 	// Get daily stats for last 7 days
 	end := time.Now()
 	start := end.AddDate(0, 0, -7)
-	dailyStats, err := s.notificationRepo.GetDailyNotifications(ctx, start, end)
+	dailyStats, err := s.notificationRepo.GetDailyNotificationStats(ctx, start, end)
 	if err != nil {
 		dailyStats = []*interfaces.DailyNotificationCount{}
 	}
-	
-	return &dto.NotificationStatsResponse{
+	response := &dto.NotificationStatsResponse{
 		Total:        stats.Total,
 		UniqueUsers:  stats.UniqueUsers,
 		UniqueSenders: stats.UniqueSenders,
-		ReadCount:    stats.ReadCount,
-		UnreadCount:  stats.UnreadCount,
-		Latest:       stats.Latest,
-		Earliest:     stats.Earliest,
+		ReadCount:    stats.Read,
+		UnreadCount:  stats.Unread,
+		Latest:       stats.LastNotification,
+		Earliest:     stats.FirstNotification,
+		TypeStats:    stats.TypeStats,
 		DailyStats:   dailyStats,
-	}, nil
+	}
+	// Cache for 5 minutes
+	if s.redisAdapter != nil {
+		_ = s.redisAdapter.CacheSet(ctx, cacheKey, response, 5*time.Minute)
+	}
+	return response, nil
 }
 
 // ======================================================================
-= Get User Notification Stats
+// Get User Notification Stats
 // ======================================================================
 
 // GetUserNotificationStats returns notification stats for a user.
 func (s *notificationService) GetUserNotificationStats(ctx context.Context, userID string) (*dto.UserNotificationStatsResponse, error) {
+	// Check if user exists
+	_, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrUserNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
 	total, err := s.notificationRepo.CountByUserID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count notifications: %w", err)
 	}
-	
 	unread, err := s.notificationRepo.CountUnread(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count unread: %w", err)
 	}
-	
 	// Get type distribution
 	typeStats, err := s.notificationRepo.GetNotificationTypeStats(ctx, userID)
 	if err != nil {
 		typeStats = []*interfaces.NotificationTypeStat{}
 	}
-	
 	// Get latest notification
-	latest, err := s.notificationRepo.GetRecentNotifications(ctx, userID, 1)
+	latest, err := s.notificationRepo.GetRecentByUserID(ctx, userID, 1)
 	if err != nil || len(latest) == 0 {
 		latest = []*entities.Notification{}
 	}
-	
-	return &dto.UserNotificationStatsResponse{
-		UserID:       userID,
-		Total:        total,
-		Unread:       unread,
-		Read:         total - unread,
-		TypeStats:    typeStats,
+	response := &dto.UserNotificationStatsResponse{
+		UserID:     userID,
+		Total:      total,
+		Unread:     unread,
+		Read:       total - unread,
+		TypeStats:  typeStats,
 		LatestAt: func() time.Time {
 			if len(latest) > 0 {
 				return latest[0].CreatedAt
 			}
 			return time.Time{}
 		}(),
-	}, nil
+	}
+	return response, nil
 }
 
 // ======================================================================
@@ -660,7 +642,9 @@ func (s *notificationService) invalidateListCache(ctx context.Context, userID st
 		}
 	}
 	if len(keys) > 0 {
-		return s.redisAdapter.Delete(ctx, keys...)
+		if err := s.redisAdapter.Delete(ctx, keys...); err != nil {
+			return err
+		}
 	}
 	// Also unread notifications list
 	unreadPattern := fmt.Sprintf("unread_notifications:%s:*", userID)
@@ -704,4 +688,33 @@ func (s *notificationService) invalidateGroupedCache(ctx context.Context, userID
 		return s.redisAdapter.Delete(ctx, keys...)
 	}
 	return nil
+}
+
+// ======================================================================
+// Global Instance
+// ======================================================================
+
+var defaultNotificationService NotificationService
+
+// InitNotificationService initializes the global notification service.
+func InitNotificationService(
+	notificationRepo interfaces.NotificationRepository,
+	userRepo interfaces.UserRepository,
+	redisAdapter adapter.RedisAdapter,
+	wsHub *adapter.WebSocketHub,
+) {
+	defaultNotificationService = NewNotificationService(
+		notificationRepo,
+		userRepo,
+		redisAdapter,
+		wsHub,
+	)
+}
+
+// GetNotificationService returns the global notification service.
+func GetNotificationService() NotificationService {
+	if defaultNotificationService == nil {
+		panic("notification service not initialized")
+	}
+	return defaultNotificationService
 }
